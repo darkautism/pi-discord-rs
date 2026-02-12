@@ -1,0 +1,28 @@
+[package]
+name = "pi-discord-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A high-performance Discord Bot daemon for the pi AI coding agent."
+license = "MIT"
+keywords = ["discord", "bot", "ai", "pi", "daemon"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
+
+[dependencies]
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+toml = "0.8"
+async-trait = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+clap = { version = "4.4", features = ["derive"] }
+rust-embed = "8.0"
+directories = "5.0"
+
+[[bin]]
+name = "discord-rs"
+path = "src/main.rs"

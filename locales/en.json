@@ -1,0 +1,16 @@
+{
+  "processing": "🤔 Processing...",
+  "pi_working": "🤔 Pi is working...",
+  "thinking_header": "🧠 **Thinking:**",
+  "response_header": "**Response:**",
+  "api_error": "❌ API Error",
+  "user_aborted": "❌ User Aborted Execution",
+  "aborted_desc": "The command was aborted.",
+  "pi_response": "✅ Pi's Response",
+  "done": "*(Done)*",
+  "wait": "Wait...",
+  "abort_sent": "🛑 Sent Abort signal.",
+  "loading_skill": "🪄 Loading skill: `{}`",
+  "exec_success": "✅ Successfully executed `{}`",
+  "exec_failed": "❌ Failed to execute `{}`"
+}
