@@ -480,9 +480,17 @@ impl EventHandler for Handler {
                 let mut instances = self.instances.write().await;
                 if let Some(pi) = instances.get(&channel_id) { pi.clone() }
                 else {
-                    let pi = PiInstance::new(channel_id, &*self.state.config.read().await).await.unwrap();
-                    instances.insert(channel_id, pi.clone());
-                    pi
+                    match PiInstance::new(channel_id, &*self.state.config.read().await).await {
+                        Ok(pi) => {
+                            instances.insert(channel_id, pi.clone());
+                            pi
+                        },
+                        Err(e) => {
+                            error!("❌ Failed to start Pi instance for channel {}: {}", channel_id, e);
+                            let _ = msg.reply(&ctx.http, format!("❌ **System Error**: Failed to initialize Pi process.\nDetails: `{}`", e)).await;
+                            return;
+                        }
+                    }
                 }
             }
         };
@@ -700,6 +708,9 @@ fn manage_daemon(action: DaemonAction) -> anyhow::Result<()> {
                 "pi".to_string()
             };
 
+            // Capture current PATH to ensure 'node' and other tools can be found in systemd
+            let current_path = std::env::var("PATH").unwrap_or_default();
+
             let content = format!(r#"[Unit]
 Description=Pi Discord RS
 After=network.target
@@ -708,12 +719,13 @@ After=network.target
 Type=simple
 ExecStart={} run
 Environment="PI_BINARY={}"
+Environment="PATH={}"
 Restart=on-failure
 RestartSec=5s
 
 [Install]
 WantedBy=default.target
-"#, exe_path.display(), pi_binary);
+"#, exe_path.display(), pi_binary, current_path);
             
             fs::write(&service_file, content)?;
             println!("Created systemd service file at: {}", service_file.display());

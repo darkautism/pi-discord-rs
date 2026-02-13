@@ -1,6 +1,6 @@
 [package]
 name = "pi-discord-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "A high-performance Discord Bot daemon for the pi AI coding agent."
 license = "MIT"
