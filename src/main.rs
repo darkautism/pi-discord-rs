@@ -12,11 +12,12 @@ use tokio::sync::{Mutex, broadcast, RwLock};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{info, Level};
+use tracing::{info, warn, error, Level};
 use std::sync::atomic::{AtomicBool, Ordering};
 use rust_embed::RustEmbed;
 use directories::UserDirs;
 use clap::{Parser, Subcommand};
+use tokio::signal::unix::{signal, SignalKind};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -34,6 +35,8 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Reload configuration for the running daemon
+    Reload,
     /// Show version info
     Version,
 }
@@ -59,6 +62,13 @@ struct Config {
     language: String,
 }
 
+#[derive(Clone)]
+struct AppState {
+    config: Arc<RwLock<Config>>,
+    i18n: Arc<RwLock<I18n>>,
+    config_path: PathBuf,
+}
+
 fn default_lang() -> String { "zh-TW".to_string() }
 
 struct I18n {
@@ -73,7 +83,7 @@ impl I18n {
         } else {
             // Last ditch fallback to English
             eprintln!("Warning: Locale {} not found, defaulting to en", lang);
-            r#"{"processing": "Processing...", "api_error": "API Error", "user_aborted": "Aborted", "aborted_desc": "User aborted.", "pi_response": "Pi Response", "pi_working": "Thinking...", "wait": "Please wait...", "abort_sent": "Abort signal sent.", "loading_skill": "Loading skill {}...", "exec_success": "Success: {}", "exec_failed": "Failed: {}"}"#.to_string()
+            r#"{"processing": "Processing...", "api_error": "API Error", "user_aborted": "Aborted", "aborted_desc": "User aborted.", "pi_response": "Pi Response", "pi_working": "Thinking...", "wait": "Please wait...", "abort_sent": "Abort signal sent.", "loading_skill": "Loading skill {}...", "exec_success": "Success: {}", "exec_failed": "Failed: {}", "auto_retry": "🔄 **Auto-retry** ({}/{}) due to error..."}"#.to_string()
         };
         let texts = serde_json::from_str(&content).expect("Failed to parse locale");
         I18n { texts }
@@ -83,6 +93,13 @@ impl I18n {
     }
     fn get_arg(&self, key: &str, arg: &str) -> String {
         self.get(key).replace("{}", arg)
+    }
+    fn get_args<S: AsRef<str>>(&self, key: &str, args: &[S]) -> String {
+        let mut s = self.get(key);
+        for arg in args {
+            s = s.replacen("{}", arg.as_ref(), 1);
+        }
+        s
     }
 }
 
@@ -142,7 +159,7 @@ impl PiInstance {
             }
         });
 
-        // Task to parse stdout
+                // Task to parse stdout
         let tx_c = tx.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -206,8 +223,7 @@ impl PiInstance {
 
 struct Handler {
     instances: Arc<RwLock<HashMap<u64, Arc<PiInstance>>>>,
-    config: Config,
-    i18n: Arc<I18n>,
+    state: AppState,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -222,7 +238,7 @@ impl Handler {
         } else { s.to_string() }
     }
 
-    async fn start_loop(pi: Arc<PiInstance>, http: Arc<Http>, ch_id: ChannelId, i18n: Arc<I18n>) {
+    async fn start_loop(pi: Arc<PiInstance>, http: Arc<Http>, ch_id: ChannelId, state: AppState) {
         if pi.is_processing.swap(true, Ordering::SeqCst) { return; }
         tokio::spawn(async move {
             while pi.is_processing.load(Ordering::SeqCst) {
@@ -233,7 +249,12 @@ impl Handler {
                 };
                 let mut rx = pi.event_tx.subscribe();
                 let _ = pi.raw_call(json!({ "type": "prompt", "message": prompt })).await;
-                let mut discord_msg = ch_id.send_message(&http, CreateMessage::new().embed(CreateEmbed::new().title(i18n.get("processing")).color(0xFFA500)).allowed_mentions(CreateAllowedMentions::new().all_users(false))).await.unwrap();
+                let (processing_msg, _) = {
+                    let i = state.i18n.read().await;
+                    let c = state.config.read().await;
+                    (i.get("processing"), c.initial_prompt.clone())
+                };
+                let mut discord_msg = ch_id.send_message(&http, CreateMessage::new().embed(CreateEmbed::new().title(processing_msg).color(0xFFA500)).allowed_mentions(CreateAllowedMentions::new().all_users(false))).await.unwrap();
                 let (mut thinking, mut text, mut tool_info, mut status, mut last_upd) = (String::new(), String::new(), String::new(), ExecStatus::Running, std::time::Instant::now());
                 
                 let http_c = http.clone();
@@ -262,16 +283,57 @@ impl Handler {
                                 if delta["type"] == "thinking_delta" { thinking.push_str(delta["delta"].as_str().unwrap_or("")); }
                                 if delta["type"] == "text_delta" { text.push_str(delta["delta"].as_str().unwrap_or("")); }
                             }
-                            if delta["type"] == "error" { status = if delta["reason"] == "aborted" { ExecStatus::Aborted } else { ExecStatus::Error(delta["errorMessage"].as_str().unwrap_or("").to_string()) }; }
+                            if delta["type"] == "error" {
+                                let err_msg = delta["errorMessage"].as_str().unwrap_or("Unknown API error");
+                                warn!("⚠️ [PATH: API_ERROR_EVENT] Quota or API issue: {}", err_msg);
+                                status = if delta["reason"] == "aborted" { ExecStatus::Aborted } else { ExecStatus::Error(err_msg.to_string()) };
+                            }
                         }
                         Some("tool_execution_start") => tool_info = format!("🛠️ **Executing:** `{}`", ev["toolName"].as_str().unwrap_or("tool")),
                         Some("tool_execution_end") => tool_info = String::new(),
-                        Some("agent_end") => { if status == ExecStatus::Running { status = ExecStatus::Success; } }
+                        Some("message_start") => {
+                            if let Some(err) = ev["message"]["errorMessage"].as_str() {
+                                warn!("⚠️ [PATH: MSG_START_ERROR] {}", err);
+                                status = ExecStatus::Error(err.to_string());
+                            }
+                        }
+                        Some("auto_retry_start") => {
+                            let attempt = ev["attempt"].as_u64().unwrap_or(0);
+                            let max = ev["maxAttempts"].as_u64().unwrap_or(0);
+                            tool_info = state.i18n.read().await.get_args("auto_retry", &[&attempt.to_string(), &max.to_string()]);
+                            // Reset text buffer on retry to avoid stale content
+                            thinking.clear();
+                            text.clear();
+                        }
+                        Some("agent_end") => { 
+                            if let Some(err) = ev["errorMessage"].as_str() {
+                                status = ExecStatus::Error(err.to_string());
+                            } else if let Some(msgs) = ev["messages"].as_array() {
+                                if let Some(last_msg) = msgs.last() {
+                                    if let Some(err) = last_msg["errorMessage"].as_str() {
+                                        status = ExecStatus::Error(err.to_string());
+                                    } else if status == ExecStatus::Running {
+                                        status = ExecStatus::Success;
+                                    }
+                                } else if status == ExecStatus::Running { status = ExecStatus::Success; }
+                            } else if status == ExecStatus::Running { 
+                                status = ExecStatus::Success; 
+                            } 
+                        }
+                        Some("error") => {
+                            let err_msg = ev["message"].as_str()
+                                .or(ev["error"].as_str())
+                                .unwrap_or("Unknown top-level error");
+                            warn!("⚠️ [PATH: TOP_LEVEL_ERROR] {}", err_msg);
+                            status = ExecStatus::Error(err_msg.to_string());
+                        }
                         _ => {}
                     }
                     if last_upd.elapsed() >= Duration::from_secs(2) || status != ExecStatus::Running {
                         let mut embed = CreateEmbed::new();
                         let mut desc = String::new();
+                        let i18n = state.i18n.read().await;
+                        
                         if !thinking.is_empty() {
                             let thinking_txt = format!("🧠 {}", Self::safe_truncate(&thinking, 500));
                             // Format: Start with "> ", replace all internal newlines with "\n> "
@@ -285,6 +347,7 @@ impl Handler {
                         }
                         match status {
                             ExecStatus::Error(ref e) => {
+                                info!("🚩 [PATH: DISPLAY_ERROR] Rendering error to Discord: {}", e);
                                 embed = embed.title(i18n.get("api_error")).color(0xff0000);
                                 if !text.is_empty() { desc.push_str(&format!("{}\n\n", text)); }
                                 desc.push_str(&format!("❌ **Error:** {}", e));
@@ -324,7 +387,7 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("✅ Connected as {}!", ready.user.name);
         let http = ctx.http.clone();
-        let cfg = self.config.clone();
+        let cfg = self.state.config.read().await.clone();
         tokio::spawn(async move {
             let mut model_choices = Vec::new();
             if let Ok(pi) = PiInstance::new(0, &cfg).await {
@@ -368,14 +431,14 @@ impl EventHandler for Handler {
                 let mut instances = self.instances.write().await;
                 if let Some(pi) = instances.get(&channel_id) { pi.clone() }
                 else {
-                    let pi = PiInstance::new(channel_id, &self.config).await.unwrap();
+                    let pi = PiInstance::new(channel_id, &*self.state.config.read().await).await.unwrap();
                     instances.insert(channel_id, pi.clone());
                     pi
                 }
             }
         };
         pi.msg_buffer.lock().await.push(if msg.content.starts_with("!") { &msg.content[1..] } else { &msg.content }.to_string());
-        Self::start_loop(pi, ctx.http.clone(), msg.channel_id, self.i18n.clone()).await;
+        Self::start_loop(pi, ctx.http.clone(), msg.channel_id, self.state.clone()).await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -387,7 +450,7 @@ impl EventHandler for Handler {
                 if cmd_name == "abort" {
                     let _ = pi.raw_call(json!({ "type": "abort" })).await;
                     pi.msg_buffer.lock().await.clear();
-                    let _ = command.create_response(&ctx.http, CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(self.i18n.get("abort_sent")).ephemeral(true))).await;
+                    let _ = command.create_response(&ctx.http, CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(self.state.i18n.read().await.get("abort_sent")).ephemeral(true))).await;
                     return;
                 }
                 let _ = command.defer_ephemeral(&ctx.http).await;
@@ -411,14 +474,14 @@ impl EventHandler for Handler {
                             let _ = fs::remove_file(session_file);
                         }
                         
-                        let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(self.i18n.get_arg("exec_success", "clear"))).await;
+                        let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(self.state.i18n.read().await.get_arg("exec_success", "clear"))).await;
                         return;
                     }
                     "skill" => {
                         let n = command.data.options.iter().find(|o| o.name == "name").and_then(|o| o.value.as_str()).unwrap_or("");
                         pi.msg_buffer.lock().await.push(format!("/skill:{}", n));
-                        Self::start_loop(pi.clone(), ctx.http.clone(), command.channel_id, self.i18n.clone()).await;
-                        let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(self.i18n.get_arg("loading_skill", n))).await;
+                        Self::start_loop(pi.clone(), ctx.http.clone(), command.channel_id, self.state.clone()).await;
+                        let _ = command.edit_response(&ctx.http, EditInteractionResponse::new().content(self.state.i18n.read().await.get_arg("loading_skill", n))).await;
                         return;
                     }
                     _ => None,
@@ -427,16 +490,16 @@ impl EventHandler for Handler {
                     let mut rx = pi.event_tx.subscribe();
                     let http = ctx.http.clone();
                     let cmd_clone = command.clone();
-                    let i18n = self.i18n.clone();
+                    let state = self.state.clone();
                     let pi_c = pi.clone();
-                    let initial_prompt = self.config.initial_prompt.clone();
+                    let initial_prompt = self.state.config.read().await.initial_prompt.clone();
                     let cmd_name_c = cmd_name.clone();
                     
                     tokio::spawn(async move {
                         while let Ok(event) = rx.recv().await {
                             if event["type"] == "response" && event["id"] == rid {
                                 let success = event["success"].as_bool().unwrap_or(false);
-                                let c = if success { i18n.get_arg("exec_success", &cmd_name_c) } else { i18n.get_arg("exec_failed", &cmd_name_c) };
+                                let c = if success { state.i18n.read().await.get_arg("exec_success", &cmd_name_c) } else { state.i18n.read().await.get_arg("exec_failed", &cmd_name_c) };
                                 let _ = cmd_clone.edit_response(&http, EditInteractionResponse::new().content(c)).await;
                                 
                                 // If clear was successful, re-send the initial prompt if it exists
@@ -483,9 +546,54 @@ language = "zh-TW"
     let log_level = match config.debug_level.as_deref() { Some("DEBUG") => Level::DEBUG, _ => Level::INFO };
     tracing_subscriber::fmt().with_max_level(log_level).init();
     
-    let i18n = Arc::new(I18n::new(&config.language));
-    let handler = Handler { instances: Arc::new(RwLock::new(HashMap::new())), config: config.clone(), i18n };
-    let mut client = Client::builder(&config.discord_token, GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT | GatewayIntents::GUILDS).event_handler(handler).await?;
+    let i18n = Arc::new(RwLock::new(I18n::new(&config.language)));
+    let config = Arc::new(RwLock::new(config));
+    let state = AppState { config: config.clone(), i18n: i18n.clone(), config_path: config_path.clone() };
+    
+    // Spawn signal handler
+    let state_c = state.clone();
+    let config_path_c = config_path.clone(); // Capture path
+    tokio::spawn(async move {
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to register SIGHUP handler: {}", e);
+                return;
+            }
+        };
+        loop {
+            sighup.recv().await;
+            info!("🔄 Received SIGHUP, reloading configuration...");
+            
+            match fs::read_to_string(&config_path_c) {
+                Ok(content) => {
+                    match toml::from_str::<Config>(&content) {
+                        Ok(new_cfg) => {
+                            // Update Config
+                            let mut c_guard = state_c.config.write().await;
+                            let old_lang = c_guard.language.clone();
+                            *c_guard = new_cfg.clone();
+                            drop(c_guard); // Drop lock early
+                            
+                            // Reload I18n if needed
+                            if old_lang != new_cfg.language {
+                                let mut i_guard = state_c.i18n.write().await;
+                                *i_guard = I18n::new(&new_cfg.language);
+                                info!("🌐 Language switched to: {}", new_cfg.language);
+                            }
+                            info!("✅ Configuration reloaded successfully!");
+                        }
+                        Err(e) => error!("❌ Failed to parse config on reload: {}", e),
+                    }
+                }
+                Err(e) => error!("❌ Failed to read config file on reload: {}", e),
+            }
+        }
+    });
+
+    let handler = Handler { instances: Arc::new(RwLock::new(HashMap::new())), state: state.clone() };
+    let token = state.config.read().await.discord_token.clone();
+    let mut client = Client::builder(&token, GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT | GatewayIntents::GUILDS).event_handler(handler).await?;
     client.start().await?;
     Ok(())
 }
@@ -555,6 +663,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Run) => run_bot().await?,
         Some(Commands::Daemon { action }) => manage_daemon(action)?,
+        Some(Commands::Reload) => {
+            let res = StdCommand::new("systemctl").arg("--user").arg("kill").arg("-s").arg("HUP").arg("discord-rs").status();
+            match res {
+                Ok(status) if status.success() => println!("✅ Reload signal sent successfully."),
+                _ => eprintln!("❌ Failed to send reload signal. Is the daemon running?"),
+            }
+        }
         Some(Commands::Version) => {
             println!("discord-rs v{}", env!("CARGO_PKG_VERSION"));
         },

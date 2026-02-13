@@ -12,5 +12,6 @@
   "abort_sent": "🛑 Sent Abort signal.",
   "loading_skill": "🪄 Loading skill: `{}`",
   "exec_success": "✅ Successfully executed `{}`",
-  "exec_failed": "❌ Failed to execute `{}`"
+  "exec_failed": "❌ Failed to execute `{}`",
+  "auto_retry": "🔄 **Auto-retry** ({}/{}) due to error..."
 }
