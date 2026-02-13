@@ -25,6 +25,38 @@ A high-performance Discord Bot daemon for the `pi` AI coding agent, written in R
 2.  **OAuth2 Scopes**：`bot`, `applications.commands`
 3.  **Bot Permissions**：`Send Messages`, `Embed Links`, `Read Messages/View Channels`。
 
+### 安裝與設定 (Installation & Setup)
+
+**1. 安裝程式**
+```bash
+cargo install pi-discord-rs
+```
+
+**2. 初始化設定檔**
+直接執行一次程式：
+```bash
+discord-rs run
+```
+程式會提示 `~/.pi/discord-rs/config.toml` 不存在並自動為您建立一個範本，隨後結束。
+
+**3. 填入 Discord Token**
+使用編輯器（如 `nano` 或 `vim`）開啟設定檔：
+```bash
+nano ~/.pi/discord-rs/config.toml
+```
+將您的 Discord Bot Token 填入：
+```toml
+discord_token = "你的_DISCORD_BOT_TOKEN"
+initial_prompt = "你是一個助手，請用台灣繁體中文回覆。"
+debug_level = "INFO"
+language = "zh-TW"
+```
+
+**4. 啟動機器人**
+您可以選擇直接執行或設定為系統服務：
+- **直接執行**：`discord-rs run`
+- **系統服務**：`discord-rs daemon enable`
+
 ### 安全認證機制 (Authentication)
 為了確保安全，Bot 預設不會回應未經授權的頻道或用戶（DM）。
 
@@ -83,6 +115,38 @@ Enable these in the Discord Developer Portal:
 1.  **Privileged Gateway Intents**: Turn ON **`MESSAGE CONTENT INTENT`**.
 2.  **OAuth2 Scopes**: `bot`, `applications.commands`.
 3.  **Bot Permissions**: `Send Messages`, `Embed Links`, `Read Messages/View Channels`.
+
+### Installation & Setup
+
+**1. Install the binary**
+```bash
+cargo install pi-discord-rs
+```
+
+**2. Initialize configuration**
+Run the program once:
+```bash
+discord-rs run
+```
+The bot will create a template at `~/.pi/discord-rs/config.toml` and exit.
+
+**3. Configure your Token**
+Edit the config file:
+```bash
+nano ~/.pi/discord-rs/config.toml
+```
+Fill in your Discord Bot Token:
+```toml
+discord_token = "YOUR_DISCORD_BOT_TOKEN"
+initial_prompt = "You are a helpful assistant."
+debug_level = "INFO"
+language = "en"
+```
+
+**4. Start the Bot**
+Run directly or as a daemon:
+- **Run directly**: `discord-rs run`
+- **As a service**: `discord-rs daemon enable`
 
 ### Authentication Mechanism
 By default, the bot ignores unauthorized channels and users.
