@@ -16,12 +16,14 @@ use tracing::{error, info, warn, Level};
 mod agent;
 mod auth;
 mod commands;
+mod composer;
 mod config;
 mod migrate;
 mod session;
 
 use auth::AuthManager;
 use commands::agent::{handle_button, ChannelConfig};
+use composer::{BlockType, EmbedComposer};
 use config::Config;
 use session::SessionManager;
 
@@ -198,7 +200,6 @@ impl Handler {
             }
         };
 
-        // 如果有初始訊息，發送給 agent
         if let Some(msg) = initial_message {
             let mut final_msg = msg;
             
@@ -222,9 +223,7 @@ impl Handler {
             }
         }
 
-        let mut thinking = String::new();
-        let mut text = String::new();
-        let mut tool_info = String::new();
+        let mut composer = EmbedComposer::new(3800); // 預留空間給標題與錯誤訊息
         let mut status = ExecStatus::Running;
         let mut last_upd = std::time::Instant::now();
 
@@ -242,32 +241,31 @@ impl Handler {
             match event {
                 AgentEvent::MessageUpdate { thinking: t, text: txt, is_delta } => {
                     if is_delta {
-                        if !t.is_empty() {
-                            thinking.push_str(&t);
-                        }
-                        if !txt.is_empty() {
-                            text.push_str(&txt);
-                        }
+                        if !t.is_empty() { composer.push_delta(BlockType::Thinking, &t); }
+                        if !txt.is_empty() { composer.push_delta(BlockType::Text, &txt); }
                     } else {
-                        // 防止空內容清空緩衝區
-                        if !t.is_empty() {
-                            thinking = t;
-                        }
-                        if !txt.is_empty() {
-                            text = txt;
-                        }
+                        // 非 Delta 模式採用更新模式，防止重複區塊堆疊
+                        if !t.is_empty() { composer.update_last_block(BlockType::Thinking, t); }
+                        if !txt.is_empty() { composer.update_last_block(BlockType::Text, txt); }
                     }
                 }
                 AgentEvent::ToolExecutionStart { name } => {
-                    tool_info = format!("🛠️ **執行中:** `{}`", name);
+                    composer.update_last_block(BlockType::Text, format!("🛠️ **正在執行工具:** `{}`", name));
+                }
+                AgentEvent::ToolExecutionUpdate { output } => {
+                    let char_vec: Vec<char> = output.chars().collect();
+                    let truncated = if char_vec.len() > 200 {
+                        format!("...{}", char_vec[char_vec.len() - 200..].iter().collect::<String>())
+                    } else {
+                        output
+                    };
+                    composer.update_last_block(BlockType::Tool, truncated);
                 }
                 AgentEvent::ToolExecutionEnd { .. } => {
-                    tool_info.clear();
+                    // 工具結束後可選擇是否保留精簡日誌
                 }
                 AgentEvent::AutoRetry { attempt, max } => {
-                    tool_info = format!("🔄 **自動重試** ({}/{}) 發生錯誤...", attempt, max);
-                    thinking.clear();
-                    text.clear();
+                    composer.update_last_block(BlockType::Text, format!("🔄 **自動重試** ({}/{})", attempt, max));
                 }
                 AgentEvent::AgentEnd { success, error } => {
                     status = if success {
@@ -285,54 +283,30 @@ impl Handler {
                 AgentEvent::CommandResponse { .. } => {}
             }
 
-            // 每 2 秒更新一次或狀態改變時
-            if last_upd.elapsed() >= std::time::Duration::from_secs(2) || status != ExecStatus::Running
+            // 每 1.5 秒更新一次或狀態改變時（工業頻率）
+            if last_upd.elapsed() >= std::time::Duration::from_millis(1500) || status != ExecStatus::Running
             {
                 let mut embed = CreateEmbed::new();
-                let mut desc = String::new();
                 let i18n = state.i18n.read().await;
-
-                if !thinking.is_empty() {
-                    let thinking_txt = format!("🧠 {}", Self::safe_truncate(&thinking, 500));
-                    desc.push_str("> ");
-                    desc.push_str(&thinking_txt.replace('\n', "\n> "));
-                    desc.push_str("\n\n");
-                }
+                let desc = composer.render();
 
                 match &status {
                     ExecStatus::Error(e) => {
-                        embed = embed.title(i18n.get("api_error")).color(0xff0000);
-                        if !text.is_empty() {
-                            desc.push_str(&format!("{}\n\n", text));
-                        }
-                        desc.push_str(&format!("❌ **錯誤:** {}", e));
+                        embed = embed.title(i18n.get("api_error")).color(0xff0000).description(format!("{}\n\n❌ **錯誤:** {}", desc, e));
                     }
                     ExecStatus::Aborted => {
-                        embed = embed.title(i18n.get("user_aborted")).color(0xff0000);
-                        if !text.is_empty() {
-                            desc.push_str(&format!("{}\n\n", text));
-                        }
-                        desc.push_str(&format!("⚠️ {}", i18n.get("aborted_desc")));
+                        embed = embed.title(i18n.get("user_aborted")).color(0xff0000).description(format!("{}\n\n⚠️ {}", desc, i18n.get("aborted_desc")));
                     }
                     ExecStatus::Success => {
-                        embed = embed.title(i18n.get("pi_response")).color(0x00ff00);
-                        desc.push_str(&text);
+                        embed = embed.title(i18n.get("pi_response")).color(0x00ff00).description(desc);
                     }
                     ExecStatus::Running => {
-                        embed = embed.title(i18n.get("pi_working")).color(0xFFA500);
-                        if !tool_info.is_empty() {
-                            desc.push_str(&format!("{}\n\n", tool_info));
-                        }
-                        desc.push_str(&text);
+                        embed = embed.title(i18n.get("pi_working")).color(0xFFA500).description(if desc.is_empty() { i18n.get("wait") } else { desc });
                     }
-                }
-
-                if desc.is_empty() {
-                    desc = i18n.get("wait");
                 }
 
                 let _ = discord_msg
-                    .edit(&http, EditMessage::new().embed(embed.description(Self::safe_truncate(&desc, 4000))))
+                    .edit(&http, EditMessage::new().embed(embed))
                     .await;
 
                 last_upd = std::time::Instant::now();

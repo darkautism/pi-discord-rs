@@ -197,18 +197,7 @@ impl PiAgent {
                         }
                     }
                     if !output.is_empty() {
-                        // 只留最後 200 字
-                        let char_vec: Vec<char> = output.chars().collect();
-                        let truncated = if char_vec.len() > 200 {
-                            format!("...{}", char_vec[char_vec.len() - 200..].iter().collect::<String>())
-                        } else {
-                            output
-                        };
-                        let _ = tx.send(AgentEvent::MessageUpdate { 
-                            thinking: String::new(), 
-                            text: format!("\n```\n{}\n```", truncated), 
-                            is_delta: true 
-                        });
+                        let _ = tx.send(AgentEvent::ToolExecutionUpdate { output });
                     }
                 }
             }
@@ -220,9 +209,15 @@ impl PiAgent {
             }
             Some("agent_end") => {
                 if let Some(err) = val["errorMessage"].as_str() {
-                    let _ = tx.send(AgentEvent::AgentEnd { success: false, error: Some(err.to_string()) });
+                    let _ = tx.send(AgentEvent::AgentEnd {
+                        success: false,
+                        error: Some(err.to_string()),
+                    });
                 } else {
-                    let _ = tx.send(AgentEvent::AgentEnd { success: true, error: None });
+                    let _ = tx.send(AgentEvent::AgentEnd {
+                        success: true,
+                        error: None,
+                    });
                 }
             }
             Some("response") => {

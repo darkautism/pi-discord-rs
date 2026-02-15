@@ -32,6 +32,9 @@ pub enum AgentEvent {
         success: bool,
         error: Option<String>,
     },
+    ToolExecutionUpdate {
+        output: String,
+    },
     AutoRetry {
         attempt: u64,
         max: u64,
