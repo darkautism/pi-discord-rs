@@ -1,13 +1,14 @@
+use crate::migrate;
+use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
+use fs2::FileExt;
+use rand::distributions::Alphanumeric;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc, Duration};
-use fs2::FileExt;
-use rand::{Rng, distributions::Alphanumeric};
-use anyhow::Result;
-use directories::UserDirs;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuthEntry {
@@ -38,19 +39,19 @@ pub struct PendingStore {
 }
 
 pub struct AuthManager {
-    base_dir: PathBuf,
+    auth_path: PathBuf,
+    pending_path: PathBuf,
 }
 
 impl AuthManager {
     pub fn new() -> Self {
-        let user_dirs = UserDirs::new().expect("Could not find user home directory");
-        let base_dir = user_dirs.home_dir().join(".pi").join("discord-rs");
+        let base_dir = migrate::get_base_dir();
         fs::create_dir_all(&base_dir).unwrap();
-        Self { base_dir }
+        Self {
+            auth_path: base_dir.join("auth.json"),
+            pending_path: base_dir.join("pending_tokens.json"),
+        }
     }
-
-    fn registry_path(&self) -> PathBuf { self.base_dir.join("registry.json") }
-    fn pending_path(&self) -> PathBuf { self.base_dir.join("pending_tokens.json") }
 
     fn with_lock<T, F>(&self, path: PathBuf, default: T, f: F) -> Result<T>
     where
@@ -69,7 +70,7 @@ impl AuthManager {
         let mut content = String::new();
         let mut reader = std::io::BufReader::new(&file);
         reader.read_to_string(&mut content)?;
-        
+
         let mut data: T = if content.trim().is_empty() {
             default
         } else {
@@ -85,20 +86,18 @@ impl AuthManager {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(json.as_bytes())?;
-        
+
         file.unlock()?;
         Ok(data)
     }
 
-    pub fn is_authorized(&self, user_id: &str, channel_id: &str) -> (bool, bool) { // (authorized, mention_only)
-        // Simple read without lock for performance, assuming eventual consistency is fine for checking auth status
-        // But for strict correctness, we should lock. For now, let's just read.
-        if let Ok(content) = fs::read_to_string(self.registry_path()) {
+    pub fn is_authorized(&self, user_id: &str, channel_id: &str) -> (bool, bool) {
+        // (authorized, mention_only)
+        if let Ok(content) = fs::read_to_string(&self.auth_path) {
             if let Ok(reg) = serde_json::from_str::<Registry>(&content) {
                 // Check User
-                if let Some(_) = reg.users.get(user_id) {
-                    return (true, false); // User auth overrides channel mention_only setting? Or strict logic?
-                                          // Let's say User auth is global pass.
+                if reg.users.get(user_id).is_some() {
+                    return (true, false); // User auth overrides channel mention_only setting
                 }
                 // Check Channel
                 if let Some(entry) = reg.channels.get(channel_id) {
@@ -115,7 +114,7 @@ impl AuthManager {
             .take(6)
             .map(char::from)
             .collect();
-        
+
         let entry = PendingToken {
             token: token.clone(),
             type_: type_.to_string(),
@@ -123,43 +122,56 @@ impl AuthManager {
             expires_at: Utc::now() + Duration::minutes(5),
         };
 
-        self.with_lock(self.pending_path(), PendingStore::default(), |store| {
-            // Cleanup expired tokens
-            let now = Utc::now();
-            store.tokens.retain(|_, v| v.expires_at > now);
-            // Add new token
-            store.tokens.insert(token.clone(), entry);
-            Ok(())
-        })?;
+        self.with_lock(
+            self.pending_path.clone(),
+            PendingStore::default(),
+            |store| {
+                // Cleanup expired tokens
+                let now = Utc::now();
+                store.tokens.retain(|_, v| v.expires_at > now);
+                // Add new token
+                store.tokens.insert(token.clone(), entry);
+                Ok(())
+            },
+        )?;
 
         Ok(token)
     }
 
-    pub fn redeem_token(&self, token: &str) -> Result<(String, String)> { // (type, id)
+    pub fn redeem_token(&self, token: &str) -> Result<(String, String)> {
+        // (type, id)
         let mut found_entry: Option<PendingToken> = None;
 
         // 1. Validate and Remove Token
-        self.with_lock(self.pending_path(), PendingStore::default(), |store| {
-            let now = Utc::now();
-            store.tokens.retain(|_, v| v.expires_at > now);
+        self.with_lock(
+            self.pending_path.clone(),
+            PendingStore::default(),
+            |store| {
+                let now = Utc::now();
+                store.tokens.retain(|_, v| v.expires_at > now);
 
-            if let Some(entry) = store.tokens.remove(token) {
-                found_entry = Some(entry);
-            }
-            Ok(())
-        })?;
+                if let Some(entry) = store.tokens.remove(token) {
+                    found_entry = Some(entry);
+                }
+                Ok(())
+            },
+        )?;
 
         let entry = found_entry.ok_or_else(|| anyhow::anyhow!("Invalid or expired token"))?;
 
         // 2. Add to Registry
-        self.with_lock(self.registry_path(), Registry::default(), |reg| {
+        self.with_lock(self.auth_path.clone(), Registry::default(), |reg| {
             let auth_entry = AuthEntry {
                 authorized_at: Utc::now(),
                 mention_only: entry.type_ == "channel", // Default true for channels
             };
             match entry.type_.as_str() {
-                "user" => { reg.users.insert(entry.id.clone(), auth_entry); }
-                "channel" => { reg.channels.insert(entry.id.clone(), auth_entry); }
+                "user" => {
+                    reg.users.insert(entry.id.clone(), auth_entry);
+                }
+                "channel" => {
+                    reg.channels.insert(entry.id.clone(), auth_entry);
+                }
                 _ => {}
             }
             Ok(())
@@ -167,15 +179,15 @@ impl AuthManager {
 
         Ok((entry.type_, entry.id))
     }
-    
+
     // New method: Toggle mention_only
     pub fn set_mention_only(&self, channel_id: &str, enable: bool) -> Result<()> {
-         self.with_lock(self.registry_path(), Registry::default(), |reg| {
+        self.with_lock(self.auth_path.clone(), Registry::default(), |reg| {
             if let Some(entry) = reg.channels.get_mut(channel_id) {
                 entry.mention_only = enable;
             } else {
                 // If not authorized yet, maybe auto-authorize? No, fail.
-                 anyhow::bail!("Channel not authorized yet.");
+                anyhow::bail!("Channel not authorized yet.");
             }
             Ok(())
         })?;

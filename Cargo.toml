@@ -1,10 +1,10 @@
 [package]
-name = "pi-discord-rs"
-version = "0.1.5"
+name = "agent-discord-rs"
+version = "0.2.0"
 edition = "2021"
-description = "A high-performance Discord Bot daemon for the pi AI coding agent."
+description = "A high-performance Discord Bot daemon supporting multiple AI agents (pi, opencode)."
 license = "MIT"
-keywords = ["discord", "bot", "ai", "pi", "daemon"]
+keywords = ["discord", "bot", "ai", "agent", "daemon"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
 
@@ -21,11 +21,13 @@ async-trait = "0.1"
 uuid = { version = "1.13", features = ["v4"] }
 clap = { version = "4.5", features = ["derive"] }
 rust-embed = "8.5"
-directories = "6.0"
 fs2 = "0.4"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+dirs = "5.0"
 
 [[bin]]
-name = "discord-rs"
+name = "agent-discord"
 path = "src/main.rs"
