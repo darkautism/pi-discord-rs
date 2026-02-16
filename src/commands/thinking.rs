@@ -20,18 +20,16 @@ impl SlashCommand for ThinkingCommand {
     }
 
     fn options(&self) -> Vec<CreateCommandOption> {
-        vec![CreateCommandOption::new(
-            CommandOptionType::String,
-            "level",
-            "思考等級",
-        )
-        .required(true)
-        .add_string_choice("off", "off")
-        .add_string_choice("minimal", "minimal")
-        .add_string_choice("low", "low")
-        .add_string_choice("medium", "medium")
-        .add_string_choice("high", "high")
-        .add_string_choice("xhigh", "xhigh")]
+        vec![
+            CreateCommandOption::new(CommandOptionType::String, "level", "思考等級")
+                .required(true)
+                .add_string_choice("off", "off")
+                .add_string_choice("minimal", "minimal")
+                .add_string_choice("low", "low")
+                .add_string_choice("medium", "medium")
+                .add_string_choice("high", "high")
+                .add_string_choice("xhigh", "xhigh"),
+        ]
     }
 
     async fn execute(
@@ -64,8 +62,7 @@ impl SlashCommand for ThinkingCommand {
                 command
                     .edit_response(
                         &ctx.http,
-                        EditInteractionResponse::new()
-                            .content(format!("❌ 設定失敗: {}", e)),
+                        EditInteractionResponse::new().content(format!("❌ 設定失敗: {}", e)),
                     )
                     .await?;
             }

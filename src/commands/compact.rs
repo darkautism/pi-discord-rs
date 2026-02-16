@@ -1,8 +1,6 @@
 use super::SlashCommand;
 use async_trait::async_trait;
-use serenity::all::{
-    CommandInteraction, Context, EditInteractionResponse,
-};
+use serenity::all::{CommandInteraction, Context, EditInteractionResponse};
 use std::sync::Arc;
 
 use crate::agent::AiAgent;

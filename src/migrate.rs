@@ -27,7 +27,7 @@ pub async fn run_migrations() -> anyhow::Result<()> {
         // 新目錄已存在，檢查 config 是否需要遷移 token
         let new_config = new_dir.join("config.toml");
         let old_config = old_dir.join("config.toml");
-        
+
         if old_config.exists() && new_config.exists() {
             // 檢查新 config 是否為預設值
             let new_content = fs::read_to_string(&new_config).await.unwrap_or_default();
@@ -35,7 +35,9 @@ pub async fn run_migrations() -> anyhow::Result<()> {
                 // 檢查舊 config 是否有有效 token
                 let old_content = fs::read_to_string(&old_config).await.unwrap_or_default();
                 if !old_content.contains("YOUR_DISCORD_TOKEN_HERE") {
-                    info!("🔄 Detected placeholder token in new config, migrating from old config...");
+                    info!(
+                        "🔄 Detected placeholder token in new config, migrating from old config..."
+                    );
                     true
                 } else {
                     false
@@ -61,12 +63,12 @@ pub async fn run_migrations() -> anyhow::Result<()> {
             info!("✅ Config updated");
         }
     }
-    
+
     // 始終檢查是否需要遷移認證資料（即使 config 不需要遷移）
     if old_dir.exists() && new_dir.exists() {
         migrate_auth_and_sessions(&old_dir, &new_dir).await?;
     }
-    
+
     if !new_dir.exists() {
         // 全新安裝
         fs::create_dir_all(&new_dir).await?;
@@ -95,11 +97,11 @@ async fn migrate_config_only(old_dir: &PathBuf, new_dir: &PathBuf) -> anyhow::Re
     // 只遷移 config.toml 中的 token
     let old_config = old_dir.join("config.toml");
     let new_config = new_dir.join("config.toml");
-    
+
     if old_config.exists() {
         let old_content = fs::read_to_string(&old_config).await?;
         let mut new_content = fs::read_to_string(&new_config).await?;
-        
+
         // 提取舊 config 的 token
         if let Some(token_line) = old_content.lines().find(|l| l.starts_with("discord_token")) {
             if let Some(token) = token_line.split('=').nth(1) {
@@ -107,14 +109,13 @@ async fn migrate_config_only(old_dir: &PathBuf, new_dir: &PathBuf) -> anyhow::Re
                 // 替換新 config 的 token
                 new_content = new_content.replace(
                     r#"discord_token = "YOUR_DISCORD_TOKEN_HERE""#,
-                    &format!(r#"discord_token = "{}""#, token)
+                    &format!(r#"discord_token = "{}""#, token),
                 );
                 fs::write(&new_config, new_content).await?;
             }
         }
-        
     }
-    
+
     Ok(())
 }
 
@@ -122,34 +123,50 @@ async fn migrate_auth_and_sessions(old_dir: &PathBuf, new_dir: &PathBuf) -> anyh
     // 遷移認證資料
     let old_registry = old_dir.join("registry.json");
     let new_auth = new_dir.join("auth.json");
-    
+
     if !old_registry.exists() {
         return Ok(());
     }
-    
+
     // 讀取舊資料
     let content = fs::read_to_string(&old_registry).await?;
     let old_data: serde_json::Value = serde_json::from_str(&content)?;
-    
+
     // 檢查新資料是否需要更新（如果 users 或 channels 為空，則需要遷移）
     let need_migration = if new_auth.exists() {
         let new_content = fs::read_to_string(&new_auth).await.unwrap_or_default();
         let new_data: serde_json::Value = serde_json::from_str(&new_content).unwrap_or(json!({}));
-        
-        let old_users = old_data.get("users").and_then(|v| v.as_object()).map(|m| m.len()).unwrap_or(0);
-        let old_channels = old_data.get("channels").and_then(|v| v.as_object()).map(|m| m.len()).unwrap_or(0);
-        let new_users = new_data.get("users").and_then(|v| v.as_object()).map(|m| m.len()).unwrap_or(0);
-        let new_channels = new_data.get("channels").and_then(|v| v.as_object()).map(|m| m.len()).unwrap_or(0);
-        
+
+        let old_users = old_data
+            .get("users")
+            .and_then(|v| v.as_object())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let old_channels = old_data
+            .get("channels")
+            .and_then(|v| v.as_object())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let new_users = new_data
+            .get("users")
+            .and_then(|v| v.as_object())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let new_channels = new_data
+            .get("channels")
+            .and_then(|v| v.as_object())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
         // 如果舊資料比新資料多，需要重新遷移
         old_users > new_users || old_channels > new_channels
     } else {
         true
     };
-    
+
     if need_migration {
         info!("🔐 Migrating authentication data...");
-        
+
         let mut new_channels = serde_json::Map::new();
         if let Some(channels) = old_data.get("channels").and_then(|v| v.as_object()) {
             for (channel_id, entry) in channels {
@@ -219,7 +236,7 @@ async fn migrate_v0_to_v1(old_dir: &PathBuf, new_dir: &PathBuf) -> anyhow::Resul
     if old_config.exists() {
         info!("📄 Migrating config.toml...");
         let content = fs::read_to_string(&old_config).await?;
-        
+
         // 添加 opencode 配置區塊（如果不存在）
         let final_content = if !content.contains("[opencode]") {
             let opencode_config = r#"
@@ -233,7 +250,7 @@ port = 4096
         } else {
             content
         };
-        
+
         fs::write(&new_config, final_content).await?;
     } else {
         // 創建默認配置
@@ -277,9 +294,6 @@ pub fn get_config_path() -> PathBuf {
     get_base_dir().join("config.toml")
 }
 
-pub fn get_auth_path() -> PathBuf {
-    get_base_dir().join("auth.json")
-}
 
 pub fn get_channel_config_path() -> PathBuf {
     get_base_dir().join("channel_config.json")

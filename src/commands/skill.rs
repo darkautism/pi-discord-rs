@@ -20,12 +20,10 @@ impl SlashCommand for SkillCommand {
     }
 
     fn options(&self) -> Vec<CreateCommandOption> {
-        vec![CreateCommandOption::new(
-            CommandOptionType::String,
-            "name",
-            "Skill 名稱",
-        )
-        .required(true)]
+        vec![
+            CreateCommandOption::new(CommandOptionType::String, "name", "Skill 名稱")
+                .required(true),
+        ]
     }
 
     async fn execute(

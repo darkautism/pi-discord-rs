@@ -49,7 +49,10 @@ impl SlashCommand for MentionOnlyCommand {
         let auth = AuthManager::new();
 
         let msg = match auth.set_mention_only(&ch_id, enable) {
-            Ok(_) => format!("✅ Mention-only 模式: **{}**", if enable { "啟用" } else { "停用" }),
+            Ok(_) => format!(
+                "✅ Mention-only 模式: **{}**",
+                if enable { "啟用" } else { "停用" }
+            ),
             Err(_) => "❌ 頻道尚未認證".to_string(),
         };
 

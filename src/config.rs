@@ -68,10 +68,4 @@ port = 4096
         Ok(config)
     }
 
-    pub async fn save(&self) -> anyhow::Result<()> {
-        let config_path = super::migrate::get_config_path();
-        let content = toml::to_string_pretty(self)?;
-        tokio::fs::write(&config_path, content).await?;
-        Ok(())
-    }
 }

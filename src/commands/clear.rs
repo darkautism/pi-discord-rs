@@ -1,8 +1,6 @@
 use super::SlashCommand;
 use async_trait::async_trait;
-use serenity::all::{
-    CommandInteraction, Context, EditInteractionResponse,
-};
+use serenity::all::{CommandInteraction, Context, EditInteractionResponse};
 use std::sync::Arc;
 
 use crate::agent::AiAgent;
@@ -35,9 +33,9 @@ impl SlashCommand for ClearCommand {
 
         // 刪除本地 session 檔案
         let agent_type = agent.agent_type();
-        let session_file = migrate::get_sessions_dir(agent_type)
-            .join(format!("discord-rs-{}.jsonl", channel_id));
-        
+        let session_file =
+            migrate::get_sessions_dir(agent_type).join(format!("discord-rs-{}.jsonl", channel_id));
+
         if session_file.exists() {
             tokio::fs::remove_file(&session_file).await.ok();
         }

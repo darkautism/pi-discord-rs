@@ -1,8 +1,5 @@
 use async_trait::async_trait;
-use serenity::all::{
-    CommandInteraction, Context, CreateCommand,
-    CreateCommandOption,
-};
+use serenity::all::{CommandInteraction, Context, CreateCommand, CreateCommandOption};
 use std::sync::Arc;
 
 use crate::agent::AiAgent;

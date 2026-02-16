@@ -1,4 +1,4 @@
-use crate::agent::{AiAgent, AgentType, PiAgent, OpencodeAgent};
+use crate::agent::{AgentType, AiAgent, KiloAgent, OpencodeAgent, PiAgent};
 use crate::config::Config;
 use crate::migrate;
 use std::collections::HashMap;
@@ -48,6 +48,45 @@ impl SessionManager {
                 let api_key = op_conf.password.clone().unwrap_or_default();
                 OpencodeAgent::new(api_url, api_key)
             }
+            AgentType::Kilo => {
+                let channel_id_str = channel_id.to_string();
+                let channel_config = crate::commands::agent::ChannelConfig::load()
+                    .await
+                    .unwrap_or_default();
+                let entry = channel_config.channels.get(&channel_id_str);
+
+                let existing_sid = entry.and_then(|e| e.kilo_session_id.clone());
+                let model_opt = entry.and_then(|e| {
+                    if let (Some(p), Some(m)) = (&e.model_provider, &e.model_id) {
+                        Some((p.clone(), m.clone()))
+                    } else {
+                        None
+                    }
+                });
+
+                let api_url = "http://127.0.0.1:3333".to_string();
+                let agent = KiloAgent::new(channel_id, api_url, existing_sid, model_opt).await?;
+
+                // 如果是新創建的，更新配置儲存
+                let mut channel_config = crate::commands::agent::ChannelConfig::load()
+                    .await
+                    .unwrap_or_default();
+                let entry = channel_config
+                    .channels
+                    .entry(channel_id_str)
+                    .or_insert_with(|| crate::commands::agent::ChannelEntry {
+                        agent_type: AgentType::Kilo,
+                        authorized_at: chrono::Utc::now().to_rfc3339(),
+                        mention_only: true,
+                        kilo_session_id: None,
+                        model_provider: None,
+                        model_id: None,
+                    });
+                entry.kilo_session_id = Some(agent.session_id.clone());
+                channel_config.save().await?;
+
+                agent
+            }
         };
 
         // 儲存 session
@@ -71,13 +110,4 @@ impl SessionManager {
         sessions.remove(&channel_id);
     }
 
-    pub async fn clear_session(&self, channel_id: u64, _agent_type: AgentType) -> anyhow::Result<()> {
-        self.remove_session(channel_id).await;
-        Ok(())
-    }
-
-    pub async fn has_session(&self, channel_id: u64) -> bool {
-        let sessions = self.sessions.read().await;
-        sessions.contains_key(&channel_id)
-    }
 }

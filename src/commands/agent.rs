@@ -8,9 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::agent::{AgentType, OpencodeAgent, PiAgent};
-use crate::config::Config;
-use crate::migrate;
+use crate::agent::AgentType;
 
 pub struct AgentCommand;
 
@@ -28,6 +26,10 @@ pub struct ChannelEntry {
     pub authorized_at: String,
     #[serde(default)]
     pub mention_only: bool,
+    // 新增：持久化 Kilo 狀態
+    pub kilo_session_id: Option<String>,
+    pub model_provider: Option<String>,
+    pub model_id: Option<String>,
 }
 
 impl ChannelConfig {
@@ -56,11 +58,17 @@ impl ChannelConfig {
     }
 
     pub fn set_agent_type(&mut self, channel_id: &str, agent_type: AgentType) {
-        let entry = self.channels.entry(channel_id.to_string()).or_insert_with(|| ChannelEntry {
-            agent_type: agent_type.clone(),
-            authorized_at: chrono::Utc::now().to_rfc3339(),
-            mention_only: true,
-        });
+        let entry = self
+            .channels
+            .entry(channel_id.to_string())
+            .or_insert_with(|| ChannelEntry {
+                agent_type: agent_type.clone(),
+                authorized_at: chrono::Utc::now().to_rfc3339(),
+                mention_only: true,
+                kilo_session_id: None,
+                model_provider: None,
+                model_id: None,
+            });
         entry.agent_type = agent_type;
     }
 }
@@ -76,14 +84,13 @@ impl SlashCommand for AgentCommand {
     }
 
     fn options(&self) -> Vec<CreateCommandOption> {
-        vec![CreateCommandOption::new(
-            CommandOptionType::String,
-            "backend",
-            "選擇 agent: pi 或 opencode",
-        )
-        .required(true)
-        .add_string_choice("Pi (本地 RPC)", "pi")
-        .add_string_choice("OpenCode (HTTP API)", "opencode")]
+        vec![
+            CreateCommandOption::new(CommandOptionType::String, "backend", "選擇 agent backend")
+                .required(true)
+                .add_string_choice("Kilo (高效單例)", "kilo")
+                .add_string_choice("Pi (本地 RPC)", "pi")
+                .add_string_choice("OpenCode (HTTP API)", "opencode"),
+        ]
     }
 
     async fn execute(
@@ -175,28 +182,26 @@ pub async fn handle_button(
         // 先更新配置
         let mut channel_config = ChannelConfig::load().await?;
         channel_config.set_agent_type(&channel_id, agent_type.clone());
-        
+
         // 移除舊 session
         state.session_manager.remove_session(channel_id_u64).await;
-        
+
         // 測試並創建新 session
-        match state.session_manager.get_or_create_session(channel_id_u64, agent_type.clone()).await {
+        match state
+            .session_manager
+            .get_or_create_session(channel_id_u64, agent_type.clone())
+            .await
+        {
             Ok(_) => {
                 // 連接成功，保存配置
                 channel_config.save().await?;
-                info!(
-                    "Channel {} switched to {} backend",
-                    channel_id, agent_type
-                );
+                info!("Channel {} switched to {} backend", channel_id, agent_type);
 
                 interaction
                     .edit_response(
                         &ctx.http,
                         EditInteractionResponse::new()
-                            .content(format!(
-                                "✅ 已切換至 {} backend\n新對話已開始",
-                                agent_type
-                            ))
+                            .content(format!("✅ 已切換至 {} backend\n新對話已開始", agent_type))
                             .components(vec![]),
                     )
                     .await?;

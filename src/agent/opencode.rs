@@ -1,10 +1,9 @@
-use super::{AgentEvent, AgentState, AiAgent, ModelInfo, ContentItem, ContentType};
+use super::{AgentEvent, AgentState, AiAgent, ModelInfo};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tokio::sync::broadcast;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,7 +67,9 @@ impl OpencodeAgent {
             let s = String::from_utf8_lossy(&chunk);
             for line in s.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" { break; }
+                    if data == "[DONE]" {
+                        break;
+                    }
                     if let Ok(val) = serde_json::from_str::<ChatStreamChunk>(data) {
                         for choice in val.choices {
                             if let Some(thought) = choice.delta.reasoning_content {
@@ -77,6 +78,7 @@ impl OpencodeAgent {
                                     thinking: thought,
                                     text: String::new(),
                                     is_delta: true,
+                                    id: None,
                                 });
                             }
                             if let Some(content) = choice.delta.content {
@@ -85,12 +87,19 @@ impl OpencodeAgent {
                                     thinking: String::new(),
                                     text: content,
                                     is_delta: true,
+                                    id: None,
                                 });
                             }
                             if choice.finish_reason.is_some() {
                                 let mut msgs = self.messages.lock().await;
-                                msgs.push(Message { role: "assistant".into(), content: full_text.clone() });
-                                let _ = self.event_tx.send(AgentEvent::AgentEnd { success: true, error: None });
+                                msgs.push(Message {
+                                    role: "assistant".into(),
+                                    content: full_text.clone(),
+                                });
+                                let _ = self.event_tx.send(AgentEvent::AgentEnd {
+                                    success: true,
+                                    error: None,
+                                });
                             }
                         }
                     }
@@ -105,8 +114,11 @@ impl OpencodeAgent {
 impl AiAgent for OpencodeAgent {
     async fn prompt(&self, message: &str) -> anyhow::Result<()> {
         let mut msgs = self.messages.lock().await;
-        msgs.push(Message { role: "user".into(), content: message.to_string() });
-        
+        msgs.push(Message {
+            role: "user".into(),
+            content: message.to_string(),
+        });
+
         let model = self.model.lock().await.clone();
         let req = ChatRequest {
             messages: msgs.clone(),
@@ -114,7 +126,9 @@ impl AiAgent for OpencodeAgent {
             model,
         };
 
-        let response = self.client.post(format!("{}/chat/completions", self.api_url))
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.api_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&req)
             .send()
@@ -126,31 +140,42 @@ impl AiAgent for OpencodeAgent {
         }
 
         let agent = self.event_tx.clone(); // Capture sender
-        let self_clone = Arc::new(OpencodeAgent { 
-            client: self.client.clone(), 
-            api_url: self.api_url.clone(), 
+        let self_clone = Arc::new(OpencodeAgent {
+            client: self.client.clone(),
+            api_url: self.api_url.clone(),
             api_key: self.api_key.clone(),
             model: Mutex::new(None),
             messages: Mutex::new(Vec::new()),
-            event_tx: agent
+            event_tx: agent,
         }); // Minimal clone for thread safety in stream
-        
+
         tokio::spawn(async move {
             if let Err(e) = self_clone.handle_stream(response).await {
-                let _ = self_clone.event_tx.send(AgentEvent::Error { message: e.to_string() });
+                let _ = self_clone.event_tx.send(AgentEvent::Error {
+                    message: e.to_string(),
+                });
             }
         });
 
         Ok(())
     }
 
-    async fn set_session_name(&self, _name: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn set_session_name(&self, _name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn get_state(&self) -> anyhow::Result<AgentState> {
         let msgs = self.messages.lock().await;
-        Ok(AgentState { message_count: msgs.len() as u64, model: None })
+        Ok(AgentState {
+            message_count: msgs.len() as u64,
+            model: None,
+        })
     }
-    async fn compact(&self) -> anyhow::Result<()> { Ok(()) }
-    async fn abort(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn compact(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn abort(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn clear(&self) -> anyhow::Result<()> {
         let mut msgs = self.messages.lock().await;
         msgs.clear();
@@ -161,16 +186,32 @@ impl AiAgent for OpencodeAgent {
         *m = Some(mid.to_string());
         Ok(())
     }
-    async fn set_thinking_level(&self, _l: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn set_thinking_level(&self, _l: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn get_available_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         Ok(vec![
-            ModelInfo { provider: "opencode".into(), id: "deepseek-r1".into(), label: "DeepSeek R1".to_string() },
-            ModelInfo { provider: "opencode".into(), id: "gpt-4o".into(), label: "GPT-4o".to_string() },
+            ModelInfo {
+                provider: "opencode".into(),
+                id: "deepseek-r1".into(),
+                label: "DeepSeek R1".to_string(),
+            },
+            ModelInfo {
+                provider: "opencode".into(),
+                id: "gpt-4o".into(),
+                label: "GPT-4o".to_string(),
+            },
         ])
     }
-    async fn load_skill(&self, _n: &str) -> anyhow::Result<()> { Ok(()) }
-    fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> { self.event_tx.subscribe() }
-    fn agent_type(&self) -> &'static str { "opencode" }
+    async fn load_skill(&self, _n: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> {
+        self.event_tx.subscribe()
+    }
+    fn agent_type(&self) -> &'static str {
+        "opencode"
+    }
 }
 
 #[cfg(test)]
@@ -179,8 +220,15 @@ mod tests {
     #[tokio::test]
     async fn test_opencode_event_flow() {
         let (tx, mut rx) = broadcast::channel(10);
-        let _ = tx.send(AgentEvent::MessageUpdate { thinking: "Think".into(), text: "".into(), is_delta: true });
+        let _ = tx.send(AgentEvent::MessageUpdate {
+            thinking: "Think".into(),
+            text: "".into(),
+            is_delta: true,
+            id: None,
+        });
         let ev = rx.recv().await.unwrap();
-        if let AgentEvent::MessageUpdate { thinking, .. } = ev { assert_eq!(thinking, "Think"); }
+        if let AgentEvent::MessageUpdate { thinking, .. } = ev {
+            assert_eq!(thinking, "Think");
+        }
     }
 }
