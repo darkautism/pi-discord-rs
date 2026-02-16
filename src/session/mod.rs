@@ -1,10 +1,9 @@
+use crate::agent::{AiAgent, AgentType, PiAgent, OpencodeAgent};
+use crate::config::Config;
+use crate::migrate;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-use crate::agent::{AgentType, AiAgent, OpencodeAgent, PiAgent};
-use crate::config::Config;
-use crate::migrate;
 
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<u64, Arc<dyn AiAgent>>>>,
@@ -23,14 +22,14 @@ impl SessionManager {
         &self,
         channel_id: u64,
         agent_type: AgentType,
-    ) -> anyhow::Result<Arc<dyn AiAgent>> {
+    ) -> anyhow::Result<(Arc<dyn AiAgent>, bool)> {
         // 檢查現有 session
         {
             let sessions = self.sessions.read().await;
             if let Some(session) = sessions.get(&channel_id) {
                 // 檢查 agent 類型是否匹配
                 if session.agent_type() == agent_type.to_string() {
-                    return Ok(session.clone());
+                    return Ok((session.clone(), false));
                 }
             }
         }
@@ -39,16 +38,15 @@ impl SessionManager {
         let session: Arc<dyn AiAgent> = match agent_type {
             AgentType::Pi => {
                 let session_dir = migrate::get_sessions_dir("pi");
+                std::fs::create_dir_all(&session_dir)?;
                 let (pi_agent, _) = PiAgent::new(channel_id, &session_dir).await?;
                 pi_agent
             }
             AgentType::Opencode => {
-                let opencode_config = crate::agent::opencode::OpencodeConfig {
-                    host: self.config.opencode.host.clone(),
-                    port: self.config.opencode.port,
-                    password: self.config.opencode.password.clone(),
-                };
-                OpencodeAgent::new(channel_id, &opencode_config).await?
+                let op_conf = &self.config.opencode;
+                let api_url = format!("http://{}:{}", op_conf.host, op_conf.port);
+                let api_key = op_conf.password.clone().unwrap_or_default();
+                OpencodeAgent::new(api_url, api_key)
             }
         };
 
@@ -58,7 +56,14 @@ impl SessionManager {
             sessions.insert(channel_id, session.clone());
         }
 
-        Ok(session)
+        // 檢查是否為磁碟上的全新會話
+        let is_brand_new = if let Ok(state) = session.get_state().await {
+            state.message_count == 0
+        } else {
+            true
+        };
+
+        Ok((session, is_brand_new))
     }
 
     pub async fn remove_session(&self, channel_id: u64) {
@@ -66,18 +71,8 @@ impl SessionManager {
         sessions.remove(&channel_id);
     }
 
-    pub async fn clear_session(&self, channel_id: u64, agent_type: AgentType) -> anyhow::Result<()> {
-        // 移除記憶體中的 session
+    pub async fn clear_session(&self, channel_id: u64, _agent_type: AgentType) -> anyhow::Result<()> {
         self.remove_session(channel_id).await;
-
-        // 刪除本地 session 檔案
-        let session_dir = migrate::get_sessions_dir(&agent_type.to_string());
-        let session_file = session_dir.join(format!("discord-rs-{}.jsonl", channel_id));
-        
-        if session_file.exists() {
-            tokio::fs::remove_file(&session_file).await.ok();
-        }
-
         Ok(())
     }
 

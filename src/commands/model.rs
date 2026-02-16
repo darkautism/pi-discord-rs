@@ -7,6 +7,7 @@ use serenity::all::{
 use std::sync::Arc;
 
 use crate::agent::AiAgent;
+use tracing::{info, error};
 
 pub struct ModelCommand;
 
@@ -36,8 +37,12 @@ impl SlashCommand for ModelCommand {
 
         // 獲取可用模型列表
         let models = match agent.get_available_models().await {
-            Ok(m) => m,
+            Ok(m) => {
+                info!("Fetched {} models for /model command", m.len());
+                m
+            },
             Err(e) => {
+                error!("Failed to fetch models: {}", e);
                 command
                     .edit_response(
                         &ctx.http,
@@ -80,14 +85,17 @@ impl SlashCommand for ModelCommand {
         .max_values(1);
 
         // 發送帶有 Select Menu 的響應
-        command
+        match command
             .edit_response(
                 &ctx.http,
                 EditInteractionResponse::new()
                     .content("🤖 請選擇要使用的模型：")
                     .components(vec![CreateActionRow::SelectMenu(select_menu)]),
             )
-            .await?;
+            .await {
+                Ok(_) => info!("Successfully sent model select menu"),
+                Err(e) => error!("Failed to send model select menu: {}", e),
+            }
 
         Ok(())
     }

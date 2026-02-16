@@ -27,6 +27,7 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 dirs = "5.0"
+libc = "0.2"
 
 [[bin]]
 name = "agent-discord"
