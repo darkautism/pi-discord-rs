@@ -62,12 +62,11 @@ impl Block {
                     return String::new();
                 }
 
-                // 為了渲染美觀，我們在顯示時才對巨型輸出做局部截斷，但絕對不 replace 反引號
+                // 強化截斷：單個工具輸出限制在 500 字元，且保留開頭（通常開頭更有用）
                 let char_count = self.content.chars().count();
-                let display_content = if char_count > 1000 {
-                    let skip = char_count - 1000;
-                    if let Some((byte_pos, _)) = self.content.char_indices().nth(skip) {
-                        format!("...{}", &self.content[byte_pos..])
+                let display_content = if char_count > 500 {
+                    if let Some((byte_pos, _)) = self.content.char_indices().nth(500) {
+                        format!("{}... (truncated)", &self.content[..byte_pos])
                     } else {
                         self.content.clone()
                     }

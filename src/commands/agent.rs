@@ -5,7 +5,6 @@ use serenity::all::{
     CreateActionRow, CreateButton, CreateCommandOption, EditInteractionResponse,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::info;
 
 use crate::agent::AgentType;
@@ -100,7 +99,6 @@ impl SlashCommand for AgentCommand {
         &self,
         ctx: &Context,
         command: &CommandInteraction,
-        _agent: Arc<dyn crate::agent::AiAgent>,
         state: &crate::AppState,
     ) -> anyhow::Result<()> {
         // 先 defer，避免 3 秒超時

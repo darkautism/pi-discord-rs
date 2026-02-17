@@ -3,9 +3,7 @@ use async_trait::async_trait;
 use serenity::all::{
     CommandInteraction, CommandOptionType, Context, CreateCommandOption, EditInteractionResponse,
 };
-use std::sync::Arc;
 
-use crate::agent::AiAgent;
 
 pub struct ThinkingCommand;
 
@@ -38,7 +36,6 @@ impl SlashCommand for ThinkingCommand {
         &self,
         ctx: &Context,
         command: &CommandInteraction,
-        agent: Arc<dyn AiAgent>,
         state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;
@@ -50,6 +47,18 @@ impl SlashCommand for ThinkingCommand {
             .find(|o| o.name == "level")
             .and_then(|o| o.value.as_str())
             .unwrap_or("medium");
+
+        let channel_id_u64 = command.channel_id.get();
+        let channel_id_str = channel_id_u64.to_string();
+        let channel_config = crate::commands::agent::ChannelConfig::load()
+            .await
+            .unwrap_or_default();
+        let agent_type = channel_config.get_agent_type(&channel_id_str);
+
+        let (agent, _) = state
+            .session_manager
+            .get_or_create_session(channel_id_u64, agent_type, &state.backend_manager)
+            .await?;
 
         let i18n = state.i18n.read().await;
         match agent.set_thinking_level(level).await {

@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio_cron_scheduler::{Job, JobScheduler};
-use uuid::Uuid;
-use tracing::{info, error};
 use std::collections::HashMap;
-use tokio::sync::Mutex;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio_cron_scheduler::{Job, JobScheduler};
+use tracing::error;
+use uuid::Uuid;
+
+use crate::AppState;
+use std::sync::Weak;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct CronJobInfo {
@@ -21,13 +24,15 @@ pub struct CronManager {
     scheduler: JobScheduler,
     jobs: Arc<Mutex<HashMap<Uuid, CronJobInfo>>>,
     config_dir: PathBuf,
+    http: Arc<Mutex<Option<Arc<serenity::all::Http>>>>,
+    state: Arc<Mutex<Option<Weak<AppState>>>>,
 }
 
 impl CronManager {
     pub async fn new() -> anyhow::Result<Self> {
         let scheduler = JobScheduler::new().await?;
         scheduler.start().await?;
-        
+
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("agent-discord-rs");
@@ -37,31 +42,106 @@ impl CronManager {
             scheduler,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             config_dir,
+            http: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub async fn init(&self, http: Arc<serenity::all::Http>, state: Weak<AppState>) {
+        *self.http.lock().await = Some(http);
+        *self.state.lock().await = Some(state);
+
+        // 啟動時重新註冊所有已載入的任務
+        let jobs: Vec<CronJobInfo> = {
+            let jobs_map = self.jobs.lock().await;
+            jobs_map.values().cloned().collect()
+        };
+
+        for info in jobs {
+            let _ = self.register_job_to_scheduler(info).await;
+        }
     }
 
     pub async fn add_job(&self, info: CronJobInfo) -> anyhow::Result<Uuid> {
         let id = info.id;
-        let cron_expr = info.cron_expr.clone();
-        
-        // Save to map
+
+        // 1. 存入記憶體
         {
             let mut jobs = self.jobs.lock().await;
             jobs.insert(id, info.clone());
         }
 
-        // Logic to trigger the job will be added in Task 4
-        // For now, just register with a placeholder
+        // 2. 註冊到排程器
+        self.register_job_to_scheduler(info).await?;
+
+        // 3. 存入磁碟
+        self.save_to_disk().await?;
+
+        Ok(id)
+    }
+
+    async fn register_job_to_scheduler(&self, info: CronJobInfo) -> anyhow::Result<()> {
+        let cron_expr = info.cron_expr.clone();
+        let prompt = info.prompt.clone();
+        let channel_id_u64 = info.channel_id;
+
+        let http_ptr = self.http.clone();
+        let state_ptr = self.state.clone();
+
         let job = Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
+            let prompt = prompt.clone();
+            let http_ptr = http_ptr.clone();
+            let state_ptr = state_ptr.clone();
             Box::pin(async move {
-                info!("Cron job {} triggered!", id);
+                let http_opt = http_ptr.lock().await;
+                let state_weak_opt = state_ptr.lock().await;
+
+                if let (Some(http), Some(state_weak)) = (http_opt.as_ref(), state_weak_opt.as_ref())
+                {
+                    if let Some(state) = state_weak.upgrade() {
+                        let channel_id = serenity::model::id::ChannelId::from(channel_id_u64);
+                        let channel_id_str = channel_id.to_string();
+
+                        let channel_config = crate::commands::agent::ChannelConfig::load()
+                            .await
+                            .unwrap_or_default();
+                        let agent_type = channel_config.get_agent_type(&channel_id_str);
+
+                        match state
+                            .session_manager
+                            .get_or_create_session(
+                                channel_id_u64,
+                                agent_type,
+                                &state.backend_manager,
+                            )
+                            .await
+                        {
+                            Ok((agent, is_new)) => {
+                                crate::Handler::start_agent_loop(
+                                    agent,
+                                    http.clone(),
+                                    channel_id,
+                                    (*state).clone(),
+                                    Some(prompt),
+                                    is_new,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                error!("❌ Cron job execution failed to create session: {}", e)
+                            }
+                        }
+                    } else {
+                        error!("❌ Cron job triggered but AppState was dropped");
+                    }
+                } else {
+                    error!("❌ Cron job triggered but Http/State not initialized");
+                }
             })
         })?;
 
         self.scheduler.add(job).await?;
-        self.save_to_disk().await?;
-        
-        Ok(id)
+        Ok(())
     }
 
     async fn save_to_disk(&self) -> anyhow::Result<()> {
@@ -80,11 +160,34 @@ impl CronManager {
 
         let data = tokio::fs::read_to_string(path).await?;
         let loaded_jobs: HashMap<Uuid, CronJobInfo> = serde_json::from_str(&data)?;
-        
-        for (_, info) in loaded_jobs {
-            let _ = self.add_job(info).await;
+
+        let mut jobs = self.jobs.lock().await;
+        *jobs = loaded_jobs;
+
+        Ok(())
+    }
+
+    pub async fn get_jobs_for_channel(&self, channel_id: u64) -> Vec<CronJobInfo> {
+        let jobs = self.jobs.lock().await;
+        jobs.values()
+            .filter(|j| j.channel_id == channel_id)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn remove_job(&self, id: Uuid) -> anyhow::Result<()> {
+        // 1. Remove from scheduler
+        self.scheduler.remove(&id).await?;
+
+        // 2. Remove from memory map
+        {
+            let mut jobs = self.jobs.lock().await;
+            jobs.remove(&id);
         }
-        
+
+        // 3. Save updated list to disk
+        self.save_to_disk().await?;
+
         Ok(())
     }
 }
@@ -101,6 +204,8 @@ mod tests {
             scheduler: JobScheduler::new().await?,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             config_dir: dir.path().to_path_buf(),
+            http: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(None)),
         };
         manager.scheduler.start().await?;
 
@@ -126,6 +231,8 @@ mod tests {
             scheduler: JobScheduler::new().await?,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             config_dir: dir.path().to_path_buf(),
+            http: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(None)),
         };
         manager2.load_from_disk().await?;
 

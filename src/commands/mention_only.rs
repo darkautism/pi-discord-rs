@@ -3,9 +3,6 @@ use async_trait::async_trait;
 use serenity::all::{
     CommandInteraction, CommandOptionType, Context, CreateCommandOption, EditInteractionResponse,
 };
-use std::sync::Arc;
-
-use crate::agent::AiAgent;
 
 pub struct MentionOnlyCommand;
 
@@ -32,7 +29,6 @@ impl SlashCommand for MentionOnlyCommand {
         &self,
         ctx: &Context,
         command: &CommandInteraction,
-        _agent: Arc<dyn AiAgent>,
         state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;

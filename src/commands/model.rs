@@ -30,11 +30,21 @@ impl SlashCommand for ModelCommand {
         &self,
         ctx: &Context,
         command: &CommandInteraction,
-        agent: Arc<dyn AiAgent>,
         state: &crate::AppState,
     ) -> anyhow::Result<()> {
         // 先 defer，避免 3 秒超時
         command.defer_ephemeral(&ctx.http).await?;
+
+        let channel_id_str = command.channel_id.to_string();
+        let channel_config = crate::commands::agent::ChannelConfig::load()
+            .await
+            .unwrap_or_default();
+        let agent_type = channel_config.get_agent_type(&channel_id_str);
+
+        let (agent, _) = state
+            .session_manager
+            .get_or_create_session(command.channel_id.get(), agent_type, &state.backend_manager)
+            .await?;
 
         let i18n = state.i18n.read().await;
 

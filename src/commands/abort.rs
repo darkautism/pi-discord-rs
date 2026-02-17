@@ -1,9 +1,7 @@
 use super::SlashCommand;
 use async_trait::async_trait;
 use serenity::all::{CommandInteraction, Context, EditInteractionResponse};
-use std::sync::Arc;
 
-use crate::agent::AiAgent;
 
 pub struct AbortCommand;
 
@@ -21,10 +19,20 @@ impl SlashCommand for AbortCommand {
         &self,
         ctx: &Context,
         command: &CommandInteraction,
-        agent: Arc<dyn AiAgent>,
         state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;
+
+        let channel_id_str = command.channel_id.to_string();
+        let channel_config = crate::commands::agent::ChannelConfig::load()
+            .await
+            .unwrap_or_default();
+        let agent_type = channel_config.get_agent_type(&channel_id_str);
+
+        let (agent, _) = state
+            .session_manager
+            .get_or_create_session(command.channel_id.get(), agent_type, &state.backend_manager)
+            .await?;
 
         agent.abort().await?;
 

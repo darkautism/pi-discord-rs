@@ -3,10 +3,8 @@ use async_trait::async_trait;
 use serenity::all::{
     CommandInteraction, CommandOptionType, Context, CreateCommandOption, EditInteractionResponse,
 };
-use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::agent::AiAgent;
 use crate::i18n::I18n;
 
 pub struct LanguageCommand;
@@ -36,7 +34,6 @@ impl SlashCommand for LanguageCommand {
         &self,
         ctx: &Context,
         command: &CommandInteraction,
-        _agent: Arc<dyn AiAgent>,
         state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;

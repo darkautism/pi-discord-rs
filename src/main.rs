@@ -2,13 +2,15 @@ use agent::{AgentEvent, AiAgent, ContentType};
 use clap::{Parser, Subcommand};
 use rust_embed::RustEmbed;
 use serenity::all::{
-    Context, CreateEmbed, CreateMessage, EditMessage, EventHandler, GatewayIntents, Interaction,
-    Message, Ready,
+    Context, CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateMessage, EditMessage, EventHandler, GatewayIntents, Interaction, Message, Ready,
 };
 use serenity::async_trait;
 use serenity::Client;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, Level};
 
 mod cron;
@@ -69,6 +71,8 @@ pub struct AppState {
     pub i18n: Arc<RwLock<I18n>>,
     pub backend_manager: Arc<agent::manager::BackendManager>,
     pub cron_manager: Arc<CronManager>,
+    pub active_renders:
+        Arc<Mutex<HashMap<u64, (serenity::model::id::MessageId, Vec<JoinHandle<()>>)>>>,
 }
 
 fn load_all_prompts() -> String {
@@ -100,19 +104,19 @@ fn load_all_prompts() -> String {
         .join("\n\n")
 }
 
-struct Handler {
+pub struct Handler {
     state: AppState,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum ExecStatus {
+pub enum ExecStatus {
     Running,
     Success,
     Error(String),
 }
 
 impl Handler {
-    async fn start_agent_loop(
+    pub async fn start_agent_loop(
         agent: Arc<dyn AiAgent>,
         http: Arc<serenity::http::Http>,
         channel_id: serenity::model::id::ChannelId,
@@ -120,6 +124,26 @@ impl Handler {
         initial_message: Option<String>,
         is_brand_new: bool,
     ) {
+        let channel_id_u64 = channel_id.get();
+
+        // 1. [搶佔邏輯]: 如果該頻道有正在運行的任務，立即中斷並刪除該訊息
+        {
+            let mut active = state.active_renders.lock().await;
+            if let Some((old_msg_id, handles)) = active.remove(&channel_id_u64) {
+                for h in handles {
+                    h.abort();
+                }
+                let http_del = http.clone();
+                tokio::spawn(async move {
+                    let _ = channel_id.delete_message(&http_del, old_msg_id).await;
+                });
+                info!(
+                    "🗑️ Preempted unfinished response in channel {}",
+                    channel_id_u64
+                );
+            }
+        }
+
         let i18n = state.i18n.read().await;
         let processing_msg = i18n.get("processing");
         drop(i18n);
@@ -142,6 +166,9 @@ impl Handler {
         let composer: Arc<Mutex<EmbedComposer>> = Arc::new(Mutex::new(EmbedComposer::new(3900)));
         let status: Arc<Mutex<ExecStatus>> = Arc::new(Mutex::new(ExecStatus::Running));
 
+        // --- 任務啟動：收集所有 Handles ---
+        let mut handles = Vec::new();
+
         if let Some(msg) = initial_message {
             let mut final_msg = msg;
             if is_brand_new {
@@ -153,14 +180,10 @@ impl Handler {
             let agent_for_prompt = Arc::clone(&agent);
             let status_for_prompt = Arc::clone(&status);
             let composer_for_prompt = Arc::clone(&composer);
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 if let Err(e) = agent_for_prompt.prompt(&final_msg).await {
                     let mut s = status_for_prompt.lock().await;
                     let comp = composer_for_prompt.lock().await;
-
-                    // [核心修復]: 只有在目前還是 Running 且 Composer 完全沒收到內容時才設置 Error。
-                    // 如果 Composer 已經有內容，代表後端已經收到請求並在透過 SSE 吐字，
-                    // 此時 POST 的超時或失敗只是網路層的抖動，不應終止渲染。
                     if *s == ExecStatus::Running {
                         if comp.blocks.is_empty() {
                             *s = ExecStatus::Error(e.to_string());
@@ -169,24 +192,26 @@ impl Handler {
                         }
                     }
                 }
-            });
+            }));
         }
 
         let typing_http = http.clone();
-        let typing_task = tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             loop {
                 let _ = channel_id.broadcast_typing(&typing_http).await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
-        });
+        }));
 
-        // --- 任務 A: Render 循環 (心跳更新 Discord) ---
+        // --- 任務 A: Render 循環 ---
         let render_status = Arc::clone(&status);
         let render_composer = Arc::clone(&composer);
         let render_http = http.clone();
         let mut render_msg = discord_msg.clone();
         let render_i18n = Arc::clone(&state.i18n);
+        let render_state = state.clone();
         let render_channel_id = channel_id;
+        let render_msg_id = discord_msg.id;
 
         let render_task = tokio::spawn(async move {
             let mut last_content = String::new();
@@ -251,20 +276,32 @@ impl Handler {
                 }
 
                 if current_status != ExecStatus::Running {
-                    // 為了確保最後一刻的內容也被渲染，我們在狀態變更後再跑一輪
+                    // 完工：從活躍任務中移除自己
+                    let mut active = render_state.active_renders.lock().await;
+                    if let Some((active_msg_id, _)) = active.get(&channel_id_u64) {
+                        if *active_msg_id == render_msg_id {
+                            active.remove(&channel_id_u64);
+                            info!(
+                                "✅ Completed response registered as historical for channel {}",
+                                channel_id_u64
+                            );
+                        }
+                    }
                     break;
                 }
             }
         });
 
-        // --- 任務 B: Writer 任務 (極速吸收事件) ---
+        // --- 任務 B: Writer 任務 ---
         let mut rx = agent.subscribe_events();
-        tokio::spawn(async move {
+        let writer_status = Arc::clone(&status);
+        let writer_composer = Arc::clone(&composer);
+        let writer_task = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        let mut comp = composer.lock().await;
-                        let mut s = status.lock().await;
+                        let mut comp = writer_composer.lock().await;
+                        let mut s = writer_status.lock().await;
 
                         match event {
                             AgentEvent::MessageUpdate {
@@ -354,8 +391,13 @@ impl Handler {
             }
         });
 
-        let _ = render_task.await;
-        typing_task.abort();
+        // 登記新任務
+        handles.push(render_task);
+        handles.push(writer_task);
+        {
+            let mut active = state.active_renders.lock().await;
+            active.insert(channel_id_u64, (discord_msg.id, handles));
+        }
     }
 }
 
@@ -408,11 +450,24 @@ impl EventHandler for Handler {
         if msg.author.bot {
             return;
         }
+
+        // 1. 過濾討論串建立等系統訊息 (僅處理 Regular 訊息)
+        if msg.kind != serenity::all::MessageType::Regular
+            && msg.kind != serenity::all::MessageType::InlineReply
+        {
+            return;
+        }
+
         info!("📩 Message from {}: {}", msg.author.name, msg.content);
 
         let user_id = msg.author.id.to_string();
+        let (is_auth, mention_only) = self
+            .state
+            .auth
+            .is_authorized_with_thread(&ctx, &user_id, msg.channel_id)
+            .await;
+
         let channel_id_str = msg.channel_id.to_string();
-        let (is_auth, mention_only) = self.state.auth.is_authorized(&user_id, &channel_id_str);
 
         if !is_auth {
             if msg.mentions_me(&ctx).await.unwrap_or(false) {
@@ -461,44 +516,63 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::Command(command) = interaction {
             info!("⚔️ Command: /{}", command.data.name);
+
+            let user_id = command.user.id.to_string();
+            let (is_auth, _) = self
+                .state
+                .auth
+                .is_authorized_with_thread(&ctx, &user_id, command.channel_id)
+                .await;
+
+            if !is_auth {
+                let _ = command
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("❌ 頻道尚未認證")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+
             let cmd_name = command.data.name.clone();
-
-            let channel_id_str = command.channel_id.to_string();
-            let channel_config = ChannelConfig::load().await.unwrap_or_default();
-            let agent_type = channel_config.get_agent_type(&channel_id_str);
-
             let state = self.state.clone();
             let cmd_interaction = command.clone();
             tokio::spawn(async move {
-                if let Ok((agent, _)) = state
-                    .session_manager
-                    .get_or_create_session(
-                        cmd_interaction.channel_id.get(),
-                        agent_type,
-                        &state.backend_manager,
-                    )
-                    .await
-                {
-                    for cmd in commands::get_all_commands() {
-                        if cmd.name() == cmd_name {
-                            let _ = cmd.execute(&ctx, &cmd_interaction, agent, &state).await;
-                            break;
-                        }
+                for cmd in commands::get_all_commands() {
+                    if cmd.name() == cmd_name {
+                        let _ = cmd.execute(&ctx, &cmd_interaction, &state).await;
+                        break;
                     }
                 }
             });
+        } else if let Interaction::Modal(modal) = interaction {
+            let custom_id = modal.data.custom_id.as_str();
+            if custom_id == "cron_setup" {
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    let _ = commands::cron::handle_modal_submit(&ctx, &modal, &state).await;
+                });
+            }
         } else if let Interaction::Component(component) = interaction {
             let custom_id = component.data.custom_id.as_str();
             if custom_id.starts_with("agent_") {
                 let _ = handle_button(&ctx, &component, &self.state).await;
-            } else if custom_id.starts_with("model_select") {
-                let channel_id_str = component.channel_id.to_string();
-                let agent_type = ChannelConfig::load()
-                    .await
-                    .unwrap_or_default()
-                    .get_agent_type(&channel_id_str);
+            } else if custom_id == "cron_delete_select" {
                 let state = self.state.clone();
                 tokio::spawn(async move {
+                    let _ = commands::cron::handle_delete_select(&ctx, &component, &state).await;
+                });
+            } else if custom_id.starts_with("model_select") {
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    let channel_id_str = component.channel_id.to_string();
+                    let channel_config = ChannelConfig::load().await.unwrap_or_default();
+                    let agent_type = channel_config.get_agent_type(&channel_id_str);
+
                     if let Ok((agent, _)) = state
                         .session_manager
                         .get_or_create_session(
@@ -523,14 +597,15 @@ async fn run_bot() -> anyhow::Result<()> {
     let config = Arc::new(Config::load().await?);
     let cron_manager = Arc::new(CronManager::new().await?);
     cron_manager.load_from_disk().await.ok(); // Ignore error if file doesn't exist yet
-    let state = AppState {
+    let state = Arc::new(AppState {
         config: config.clone(),
         session_manager: Arc::new(SessionManager::new(config.clone())),
         auth: Arc::new(AuthManager::new()),
         i18n: Arc::new(RwLock::new(I18n::new(&config.language))),
         backend_manager: Arc::new(agent::manager::BackendManager::new(config.clone())),
         cron_manager,
-    };
+        active_renders: Arc::new(Mutex::new(HashMap::new())),
+    });
     let mut client = Client::builder(
         &state.config.discord_token,
         GatewayIntents::GUILD_MESSAGES
@@ -538,8 +613,17 @@ async fn run_bot() -> anyhow::Result<()> {
             | GatewayIntents::GUILDS
             | GatewayIntents::DIRECT_MESSAGES,
     )
-    .event_handler(Handler { state })
+    .event_handler(Handler {
+        state: (*state).clone(),
+    })
     .await?;
+
+    // 初始化 CronManager 的執行環境
+    state
+        .cron_manager
+        .init(client.http.clone(), Arc::downgrade(&state))
+        .await;
+
     client.start().await?;
     Ok(())
 }

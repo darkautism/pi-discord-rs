@@ -1,14 +1,13 @@
 use async_trait::async_trait;
 use serenity::all::{CommandInteraction, Context, CreateCommand, CreateCommandOption};
-use std::sync::Arc;
 
-use crate::agent::AiAgent;
 use crate::i18n::I18n;
 
 pub mod abort;
 pub mod agent;
 pub mod clear;
 pub mod compact;
+pub mod cron;
 pub mod language;
 pub mod mention_only;
 pub mod model;
@@ -35,8 +34,7 @@ pub trait SlashCommand: Send + Sync {
         &self,
         ctx: &Context,
         command: &CommandInteraction,
-        agent: Arc<dyn AiAgent>,
-        _state: &crate::AppState,
+        state: &crate::AppState,
     ) -> anyhow::Result<()>;
 }
 
@@ -51,5 +49,7 @@ pub fn get_all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(skill::SkillCommand),
         Box::new(mention_only::MentionOnlyCommand),
         Box::new(language::LanguageCommand),
+        Box::new(cron::CronCommand),
+        Box::new(cron::CronListCommand),
     ]
 }

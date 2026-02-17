@@ -108,6 +108,30 @@ impl AuthManager {
         (false, false)
     }
 
+    pub async fn is_authorized_with_thread(
+        &self,
+        ctx: &serenity::all::Context,
+        user_id: &str,
+        channel_id: serenity::model::id::ChannelId,
+    ) -> (bool, bool) {
+        let id_str = channel_id.to_string();
+        let (auth, mention) = self.is_authorized(user_id, &id_str);
+        if auth {
+            return (auth, mention);
+        }
+
+        // 如果當前頻道沒過，嘗試檢查是否為 Thread 並查找 Parent
+        if let Ok(channel) = channel_id.to_channel(&ctx.http).await {
+            if let Some(guild_channel) = channel.guild() {
+                if let Some(parent_id) = guild_channel.parent_id {
+                    return self.is_authorized(user_id, &parent_id.to_string());
+                }
+            }
+        }
+
+        (false, false)
+    }
+
     pub fn create_token(&self, type_: &str, id: &str) -> Result<String> {
         let token: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
