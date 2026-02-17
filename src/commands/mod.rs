@@ -34,6 +34,7 @@ pub trait SlashCommand: Send + Sync {
         ctx: &Context,
         command: &CommandInteraction,
         agent: Arc<dyn AiAgent>,
+        _state: &crate::AppState,
     ) -> anyhow::Result<()>;
 }
 

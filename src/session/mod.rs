@@ -22,19 +22,33 @@ impl SessionManager {
         &self,
         channel_id: u64,
         agent_type: AgentType,
+        backend_manager: &crate::agent::manager::BackendManager,
     ) -> anyhow::Result<(Arc<dyn AiAgent>, bool)> {
-        // 檢查現有 session
         {
             let sessions = self.sessions.read().await;
             if let Some(session) = sessions.get(&channel_id) {
-                // 檢查 agent 類型是否匹配
                 if session.agent_type() == agent_type.to_string() {
                     return Ok((session.clone(), false));
                 }
             }
         }
 
-        // 創建新 session
+        let channel_id_str = channel_id.to_string();
+        let channel_config = crate::commands::agent::ChannelConfig::load()
+            .await
+            .unwrap_or_default();
+        let entry = channel_config.channels.get(&channel_id_str);
+
+        let model_opt = entry.and_then(|e| {
+            if let (Some(p), Some(m)) = (&e.model_provider, &e.model_id) {
+                Some((p.clone(), m.clone()))
+            } else {
+                None
+            }
+        });
+
+        let existing_sid = entry.and_then(|e| e.session_id.clone());
+
         let session: Arc<dyn AiAgent> = match agent_type {
             AgentType::Pi => {
                 let session_dir = migrate::get_sessions_dir("pi");
@@ -43,59 +57,43 @@ impl SessionManager {
                 pi_agent
             }
             AgentType::Opencode => {
-                let op_conf = &self.config.opencode;
-                let api_url = format!("http://{}:{}", op_conf.host, op_conf.port);
-                let api_key = op_conf.password.clone().unwrap_or_default();
-                OpencodeAgent::new(api_url, api_key)
+                let port = backend_manager.ensure_backend(&AgentType::Opencode).await?;
+                let api_url = format!("http://127.0.0.1:{}", port);
+                let api_key = self.config.opencode.password.clone().unwrap_or_default();
+
+                let agent = OpencodeAgent::new(
+                    channel_id,
+                    api_url,
+                    api_key,
+                    existing_sid,
+                    model_opt,
+                    "opencode"
+                ).await?;
+                
+                self.persist_sid(channel_id, AgentType::Opencode, agent.session_id.clone()).await?;
+                agent
             }
             AgentType::Kilo => {
-                let channel_id_str = channel_id.to_string();
-                let channel_config = crate::commands::agent::ChannelConfig::load()
-                    .await
-                    .unwrap_or_default();
-                let entry = channel_config.channels.get(&channel_id_str);
+                let port = backend_manager.ensure_backend(&AgentType::Kilo).await?;
+                let api_url = format!("http://127.0.0.1:{}", port);
+                
+                let agent = KiloAgent::new(
+                    channel_id,
+                    api_url,
+                    existing_sid,
+                    model_opt
+                ).await?;
 
-                let existing_sid = entry.and_then(|e| e.kilo_session_id.clone());
-                let model_opt = entry.and_then(|e| {
-                    if let (Some(p), Some(m)) = (&e.model_provider, &e.model_id) {
-                        Some((p.clone(), m.clone()))
-                    } else {
-                        None
-                    }
-                });
-
-                let api_url = "http://127.0.0.1:3333".to_string();
-                let agent = KiloAgent::new(channel_id, api_url, existing_sid, model_opt).await?;
-
-                // 如果是新創建的，更新配置儲存
-                let mut channel_config = crate::commands::agent::ChannelConfig::load()
-                    .await
-                    .unwrap_or_default();
-                let entry = channel_config
-                    .channels
-                    .entry(channel_id_str)
-                    .or_insert_with(|| crate::commands::agent::ChannelEntry {
-                        agent_type: AgentType::Kilo,
-                        authorized_at: chrono::Utc::now().to_rfc3339(),
-                        mention_only: true,
-                        kilo_session_id: None,
-                        model_provider: None,
-                        model_id: None,
-                    });
-                entry.kilo_session_id = Some(agent.session_id.clone());
-                channel_config.save().await?;
-
+                self.persist_sid(channel_id, AgentType::Kilo, agent.session_id()).await?;
                 agent
             }
         };
 
-        // 儲存 session
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(channel_id, session.clone());
         }
 
-        // 檢查是否為磁碟上的全新會話
         let is_brand_new = if let Ok(state) = session.get_state().await {
             state.message_count == 0
         } else {
@@ -103,6 +101,29 @@ impl SessionManager {
         };
 
         Ok((session, is_brand_new))
+    }
+
+    async fn persist_sid(&self, channel_id: u64, agent_type: AgentType, sid: String) -> anyhow::Result<()> {
+        let channel_id_str = channel_id.to_string();
+        let mut channel_config = crate::commands::agent::ChannelConfig::load()
+            .await
+            .unwrap_or_default();
+            
+        let entry = channel_config
+            .channels
+            .entry(channel_id_str)
+            .or_insert_with(|| crate::commands::agent::ChannelEntry {
+                agent_type: agent_type.clone(),
+                authorized_at: chrono::Utc::now().to_rfc3339(),
+                mention_only: true,
+                session_id: None,
+                model_provider: None,
+                model_id: None,
+            });
+            
+        entry.session_id = Some(sid);
+        channel_config.save().await?;
+        Ok(())
     }
 
     pub async fn remove_session(&self, channel_id: u64) {

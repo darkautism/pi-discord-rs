@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::agent::AiAgent;
 use crate::migrate;
+use super::agent::ChannelConfig;
 
 pub struct ClearCommand;
 
@@ -23,15 +24,19 @@ impl SlashCommand for ClearCommand {
         ctx: &Context,
         command: &CommandInteraction,
         agent: Arc<dyn AiAgent>,
+        state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;
 
         let channel_id = command.channel_id.get();
 
-        // 清除 agent session
+        // 1. 清除後端 session
         agent.clear().await?;
 
-        // 刪除本地 session 檔案
+        // 2. 移除記憶體快取
+        state.session_manager.remove_session(channel_id).await;
+
+        // 3. 刪除本地 session 檔案
         let agent_type = agent.agent_type();
         let session_file =
             migrate::get_sessions_dir(agent_type).join(format!("discord-rs-{}.jsonl", channel_id));
@@ -40,10 +45,18 @@ impl SlashCommand for ClearCommand {
             tokio::fs::remove_file(&session_file).await.ok();
         }
 
+        // 4. 清除持久化配置中的 ID
+        if let Ok(mut config) = ChannelConfig::load().await {
+            if let Some(entry) = config.channels.get_mut(&channel_id.to_string()) {
+                entry.session_id = None;
+                let _ = config.save().await;
+            }
+        }
+
         command
             .edit_response(
                 &ctx.http,
-                EditInteractionResponse::new().content("✅ 已清除 session"),
+                EditInteractionResponse::new().content("✅ 已徹底清除會話狀態"),
             )
             .await?;
 

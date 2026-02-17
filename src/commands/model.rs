@@ -31,6 +31,7 @@ impl SlashCommand for ModelCommand {
         ctx: &Context,
         command: &CommandInteraction,
         agent: Arc<dyn AiAgent>,
+        _state: &crate::AppState,
     ) -> anyhow::Result<()> {
         // 先 defer，避免 3 秒超時
         command.defer_ephemeral(&ctx.http).await?;
@@ -121,6 +122,7 @@ pub async fn handle_model_select(
     ctx: &Context,
     interaction: &serenity::all::ComponentInteraction,
     agent: Arc<dyn AiAgent>,
+        _state: &crate::AppState,
 ) -> anyhow::Result<()> {
     // 先 defer，避免 3 秒超時
     interaction.defer_ephemeral(&ctx.http).await?;

@@ -22,6 +22,7 @@ impl SlashCommand for CompactCommand {
         ctx: &Context,
         command: &CommandInteraction,
         agent: Arc<dyn AiAgent>,
+        _state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;
 

@@ -34,6 +34,7 @@ impl SlashCommand for MentionOnlyCommand {
         ctx: &Context,
         command: &CommandInteraction,
         _agent: Arc<dyn AiAgent>,
+        _state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;
 

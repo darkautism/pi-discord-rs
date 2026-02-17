@@ -26,8 +26,9 @@ pub struct ChannelEntry {
     pub authorized_at: String,
     #[serde(default)]
     pub mention_only: bool,
-    // 新增：持久化 Kilo 狀態
-    pub kilo_session_id: Option<String>,
+    // 通用 Session ID，不再區分 kilo 或 opencode
+    #[serde(rename = "kilo_session_id")]
+    pub session_id: Option<String>,
     pub model_provider: Option<String>,
     pub model_id: Option<String>,
 }
@@ -65,7 +66,7 @@ impl ChannelConfig {
                 agent_type: agent_type.clone(),
                 authorized_at: chrono::Utc::now().to_rfc3339(),
                 mention_only: true,
-                kilo_session_id: None,
+                session_id: None,
                 model_provider: None,
                 model_id: None,
             });
@@ -98,6 +99,7 @@ impl SlashCommand for AgentCommand {
         ctx: &Context,
         command: &CommandInteraction,
         _agent: Arc<dyn crate::agent::AiAgent>,
+        __state: &crate::AppState,
     ) -> anyhow::Result<()> {
         // 先 defer，避免 3 秒超時
         command.defer_ephemeral(&ctx.http).await?;
@@ -189,7 +191,7 @@ pub async fn handle_button(
         // 測試並創建新 session
         match state
             .session_manager
-            .get_or_create_session(channel_id_u64, agent_type.clone())
+            .get_or_create_session(channel_id_u64, agent_type.clone(), &state.backend_manager)
             .await
         {
             Ok(_) => {

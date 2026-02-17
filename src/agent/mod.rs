@@ -128,6 +128,7 @@ impl std::str::FromStr for AgentType {
     }
 }
 
+pub mod manager;
 pub mod kilo;
 pub mod opencode;
 pub mod pi;
