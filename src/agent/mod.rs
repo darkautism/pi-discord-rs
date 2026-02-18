@@ -136,49 +136,49 @@ pub use kilo::KiloAgent;
 pub use opencode::OpencodeAgent;
 pub use pi::PiAgent;
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NoOpAgent;
+#[cfg(test)]
+pub struct MockAgent {
+    pub tx: tokio::sync::broadcast::Sender<AgentEvent>,
+}
+
+#[cfg(test)]
+impl MockAgent {
+    pub fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(100);
+        Self { tx }
+    }
+}
+
+#[cfg(test)]
 #[async_trait]
-impl AiAgent for NoOpAgent {
+impl AiAgent for MockAgent {
     async fn prompt(&self, _message: &str) -> anyhow::Result<()> {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(AgentEvent::MessageUpdate {
+                thinking: "Thinking...".into(),
+                text: "Mock Response".into(),
+                is_delta: false,
+                id: Some("test-1".into()),
+            });
+            let _ = tx.send(AgentEvent::AgentEnd {
+                success: true,
+                error: None,
+            });
+        });
         Ok(())
     }
-    async fn set_session_name(&self, _name: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
+    async fn set_session_name(&self, _name: &str) -> anyhow::Result<()> { Ok(()) }
     async fn get_state(&self) -> anyhow::Result<AgentState> {
-        Ok(AgentState {
-            message_count: 0,
-            model: None,
-        })
+        Ok(AgentState { message_count: 1, model: Some("mock".into()) })
     }
-    async fn compact(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn abort(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn clear(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn set_model(&self, _p: &str, _m: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn set_thinking_level(&self, _l: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn get_available_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        Ok(vec![])
-    }
-    async fn load_skill(&self, _n: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> {
-        let (_, rx) = broadcast::channel(1);
-        rx
-    }
-    fn agent_type(&self) -> &'static str {
-        "noop"
-    }
+    async fn compact(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn abort(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn clear(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn set_model(&self, _p: &str, _m: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn set_thinking_level(&self, _l: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn get_available_models(&self) -> anyhow::Result<Vec<ModelInfo>> { Ok(vec![]) }
+    async fn load_skill(&self, _n: &str) -> anyhow::Result<()> { Ok(()) }
+    fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> { self.tx.subscribe() }
+    fn agent_type(&self) -> &'static str { "mock" }
 }
