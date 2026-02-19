@@ -240,7 +240,7 @@ impl EmbedComposer {
 
         // 3. [Markdown 閉合護衛]: 確保不管怎麼切，代碼塊都不會露出破綻
         let backtick_count = res.matches("```").count();
-        if backtick_count % 2 != 0 {
+        if !backtick_count.is_multiple_of(2) {
             res.push_str("\n```");
         }
 
@@ -257,7 +257,7 @@ mod tests {
         let long_content = "A".repeat(1000);
         let block = Block::new(BlockType::ToolOutput, long_content);
         let rendered = block.render();
-        
+
         assert!(rendered.contains("... (truncated)"));
         assert!(rendered.len() < 600); // 500 chars + Markdown wrappers
     }
@@ -266,10 +266,15 @@ mod tests {
     fn test_markdown_guard() {
         let mut composer = EmbedComposer::new(100);
         // 手動塞入一個會導致反引號不對稱的內容
-        composer.blocks.push_back(Block::new(BlockType::Text, "```rust\n unfinished".into()));
-        
+        composer
+            .blocks
+            .push_back(Block::new(BlockType::Text, "```rust\n unfinished".into()));
+
         let rendered = composer.render();
-        assert!(rendered.ends_with("```"), "Should automatically close code block");
+        assert!(
+            rendered.ends_with("```"),
+            "Should automatically close code block"
+        );
         assert_eq!(rendered.matches("```").count() % 2, 0);
     }
 
@@ -296,16 +301,16 @@ mod tests {
         let mut composer = EmbedComposer::new(1000);
         // 本地內容較長
         composer.push_delta(Some("id1".into()), BlockType::Text, "longer_old_data");
-        
+
         let new_items = vec![
             // 傳入較短的內容 (例如網路同步時延後發生的舊事件)
             Block::with_id(BlockType::Text, "shorter".into(), "id1".into()),
             Block::with_id(BlockType::Text, "fresh".into(), "id2".into()),
         ];
-        
+
         composer.sync_content(new_items);
         assert_eq!(composer.blocks.len(), 2);
         // 如果 sync 的內容較短，應保留本地較長的內容（防止網路延遲導致抖動）
-        assert_eq!(composer.blocks[0].content, "longer_old_data"); 
+        assert_eq!(composer.blocks[0].content, "longer_old_data");
     }
 }

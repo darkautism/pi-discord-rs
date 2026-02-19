@@ -4,7 +4,6 @@ use serenity::all::{
     CommandInteraction, CommandOptionType, Context, CreateCommandOption, EditInteractionResponse,
 };
 
-
 pub struct ThinkingCommand;
 
 #[async_trait]

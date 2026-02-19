@@ -90,20 +90,15 @@ pub trait AiAgent: Send + Sync {
     fn agent_type(&self) -> &'static str;
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum AgentType {
     #[serde(rename = "pi")]
     Pi,
     #[serde(rename = "opencode")]
     Opencode,
     #[serde(rename = "kilo")]
+    #[default]
     Kilo,
-}
-
-impl Default for AgentType {
-    fn default() -> Self {
-        AgentType::Kilo
-    } // 將 Kilo 設為預設，因為它更省資源
 }
 
 impl std::fmt::Display for AgentType {
@@ -168,17 +163,40 @@ impl AiAgent for MockAgent {
         });
         Ok(())
     }
-    async fn set_session_name(&self, _name: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn get_state(&self) -> anyhow::Result<AgentState> {
-        Ok(AgentState { message_count: 1, model: Some("mock".into()) })
+    async fn set_session_name(&self, _name: &str) -> anyhow::Result<()> {
+        Ok(())
     }
-    async fn compact(&self) -> anyhow::Result<()> { Ok(()) }
-    async fn abort(&self) -> anyhow::Result<()> { Ok(()) }
-    async fn clear(&self) -> anyhow::Result<()> { Ok(()) }
-    async fn set_model(&self, _p: &str, _m: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn set_thinking_level(&self, _l: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn get_available_models(&self) -> anyhow::Result<Vec<ModelInfo>> { Ok(vec![]) }
-    async fn load_skill(&self, _n: &str) -> anyhow::Result<()> { Ok(()) }
-    fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> { self.tx.subscribe() }
-    fn agent_type(&self) -> &'static str { "mock" }
+    async fn get_state(&self) -> anyhow::Result<AgentState> {
+        Ok(AgentState {
+            message_count: 1,
+            model: Some("mock".into()),
+        })
+    }
+    async fn compact(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn abort(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn clear(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn set_model(&self, _p: &str, _m: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn set_thinking_level(&self, _l: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn get_available_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+    async fn load_skill(&self, _n: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> {
+        self.tx.subscribe()
+    }
+    fn agent_type(&self) -> &'static str {
+        "mock"
+    }
 }

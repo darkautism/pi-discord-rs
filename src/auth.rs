@@ -69,6 +69,7 @@ impl AuthManager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
 
         file.lock_exclusive()?;
@@ -81,7 +82,7 @@ impl AuthManager {
         let mut data: T = if content.trim().is_empty() {
             default
         } else {
-            serde_json::from_str(&content).unwrap_or_else(|_| default)
+            serde_json::from_str(&content).unwrap_or(default)
         };
 
         // Modify
@@ -103,7 +104,7 @@ impl AuthManager {
         if let Ok(content) = fs::read_to_string(&self.auth_path) {
             if let Ok(reg) = serde_json::from_str::<Registry>(&content) {
                 // Check User
-                if reg.users.get(user_id).is_some() {
+                if reg.users.contains_key(user_id) {
                     return (true, false); // User auth overrides channel mention_only setting
                 }
                 // Check Channel
@@ -229,57 +230,55 @@ impl AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
-    #[test]
-    fn test_auth_token_flow() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let auth_path = dir.path().join("auth.json");
-        let pending_path = dir.path().join("pending_tokens.json");
-        
-        let manager = AuthManager {
-            auth_path,
-            pending_path,
-        };
-        
-        // 1. Create Token
-        let token = manager.create_token("channel", "12345")?;
-        assert_eq!(token.len(), 6);
-        
-        // 2. Redeem Token
-        let (type_, id) = manager.redeem_token(&token)?;
-        assert_eq!(type_, "channel");
-        assert_eq!(id, "12345");
-        
-        // 3. Verify Authorization
-        let (auth, mention) = manager.is_authorized("user_0", "12345");
-        assert!(auth);
-        assert!(mention); // Channel default is mention_only = true
-        
-        Ok(())
-    }
-
-    #[test]
-    fn test_auth_user_override() -> anyhow::Result<()> {
+    fn create_test_manager() -> anyhow::Result<(TempDir, AuthManager)> {
         let dir = tempdir()?;
         let manager = AuthManager::with_paths(
             dir.path().join("auth.json"),
             dir.path().join("pending_tokens.json"),
         );
-        
+        Ok((dir, manager))
+    }
+
+    #[test]
+    fn test_auth_token_flow() -> anyhow::Result<()> {
+        let (_dir, manager) = create_test_manager()?;
+
+        // 1. Create Token
+        let token = manager.create_token("channel", "12345")?;
+        assert_eq!(token.len(), 6);
+
+        // 2. Redeem Token
+        let (type_, id) = manager.redeem_token(&token)?;
+        assert_eq!(type_, "channel");
+        assert_eq!(id, "12345");
+
+        // 3. Verify Authorization
+        let (auth, mention) = manager.is_authorized("user_0", "12345");
+        assert!(auth);
+        assert!(mention); // Channel default is mention_only = true
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_auth_user_override() -> anyhow::Result<()> {
+        let (_dir, manager) = create_test_manager()?;
+
         // 1. Authorize a channel with mention_only = true
         let token = manager.create_token("channel", "chan_1")?;
         let _ = manager.redeem_token(&token)?;
-        
+
         // 2. Authorize a user globally
         let u_token = manager.create_token("user", "user_god")?;
         let _ = manager.redeem_token(&u_token)?;
-        
+
         // 3. Check: User god should NOT be restricted by mention_only
         let (auth, mention) = manager.is_authorized("user_god", "chan_1");
         assert!(auth);
         assert!(!mention); // User auth overrides channel restriction
-        
+
         Ok(())
     }
 }

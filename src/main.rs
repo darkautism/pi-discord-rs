@@ -63,6 +63,8 @@ enum DaemonAction {
 #[folder = "prompts/"]
 struct DefaultPrompts;
 
+type ActiveRenderMap = HashMap<u64, (serenity::model::id::MessageId, Vec<JoinHandle<()>>)>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -71,8 +73,7 @@ pub struct AppState {
     pub i18n: Arc<RwLock<I18n>>,
     pub backend_manager: Arc<agent::manager::BackendManager>,
     pub cron_manager: Arc<CronManager>,
-    pub active_renders:
-        Arc<Mutex<HashMap<u64, (serenity::model::id::MessageId, Vec<JoinHandle<()>>)>>>,
+    pub active_renders: Arc<Mutex<ActiveRenderMap>>,
 }
 
 fn load_all_prompts() -> String {
@@ -135,7 +136,9 @@ impl Handler {
                 }
                 let http_del = http.clone();
                 tokio::spawn(async move {
-                    let _ = channel_id.delete_message(&http_del, old_msg_id).await;
+                    if let Err(e) = channel_id.delete_message(&http_del, old_msg_id).await {
+                        error!("❌ Failed to delete preempted message: {}", e);
+                    }
                 });
                 info!(
                     "🗑️ Preempted unfinished response in channel {}",
@@ -603,7 +606,9 @@ async fn run_bot() -> anyhow::Result<()> {
     migrate::run_migrations().await?;
     let config = Arc::new(Config::load().await?);
     let cron_manager = Arc::new(CronManager::new().await?);
-    cron_manager.load_from_disk().await.ok(); // Ignore error if file doesn't exist yet
+    if let Err(e) = cron_manager.load_from_disk().await {
+        error!("❌ Failed to load cron jobs from disk: {}", e);
+    }
     let state = Arc::new(AppState {
         config: config.clone(),
         session_manager: Arc::new(SessionManager::new(config.clone())),
@@ -697,7 +702,10 @@ WantedBy=default.target
                         .args(["--user", "enable", "--now", "agent-discord-rs.service"])
                         .status();
 
-                    println!("✅ Daemon enabled and started at {}", service_path.display());
+                    println!(
+                        "✅ Daemon enabled and started at {}",
+                        service_path.display()
+                    );
                     println!("   Exe: {}", exe_path);
                     println!("   TZ:  {}", tz);
                 }
@@ -712,9 +720,7 @@ WantedBy=default.target
                 }
             }
         }
-        _ => {
-            run_bot().await?
-        }
+        _ => run_bot().await?,
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use eventsource_client::{Client, ClientBuilder, SSE};
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,6 +119,16 @@ impl OpencodeAgent {
             body["model"] = json!({ "providerID": provider, "modelID": model });
         }
         body
+    }
+
+    #[cfg(test)]
+    fn retry_delay() -> Duration {
+        Duration::from_millis(20)
+    }
+
+    #[cfg(not(test))]
+    fn retry_delay() -> Duration {
+        Duration::from_secs(2)
     }
 
     async fn handle_event(&self, val: Value) {
@@ -253,7 +264,7 @@ impl OpencodeAgent {
                 if let Ok(msgs) = resp.json::<Value>().await {
                     if let Some(last) = msgs
                         .as_array()
-                        .and_then(|a| a.iter().filter(|m| m["role"] == "assistant").last())
+                        .and_then(|a| a.iter().rfind(|m| m["role"] == "assistant"))
                     {
                         if let Some(parts) = last["parts"].as_array() {
                             let mut items = Vec::new();
@@ -304,28 +315,11 @@ impl AiAgent for OpencodeAgent {
         let body = Self::construct_message_body(message, &model_opt);
 
         let max_retries = 3;
-        let mut last_err = None;
+        let retry_delay = Self::retry_delay();
+        let mut last_error_message: Option<String> = None;
 
         for attempt in 1..=max_retries {
-            // --- 診斷開始：事前探測 ---
-            let port = self.base_url.split(':').last().unwrap_or("0");
-            info!(
-                "🔍 [ATTEMPT {}/{}]: Checking port {}...",
-                attempt, max_retries, port
-            );
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "ps aux | grep opencode | grep -v grep && lsof -i :{} || echo 'Port not bound'",
-                    port
-                ))
-                .output()
-                .map(|out| {
-                    info!(
-                        "📊 [DIAG-SNAPSHOT]:\n{}",
-                        String::from_utf8_lossy(&out.stdout)
-                    );
-                });
+            info!("🛰️ Prompt attempt {}/{}", attempt, max_retries);
 
             let resp_res = self
                 .client
@@ -341,64 +335,52 @@ impl AiAgent for OpencodeAgent {
                     if resp.status().is_success() {
                         return Ok(());
                     }
-                    
-                    let status = resp.status();
-                    let err_msg = format!("API Error {}", status);
-                    error!("⚠️ [ATTEMPT {}/{} FAIL]: {}. Retrying in 2s...", attempt, max_retries, err_msg);
 
+                    let status = resp.status();
                     if status == 404 {
                         let mut config = crate::commands::agent::ChannelConfig::load().await?;
                         if let Some(entry) = config.channels.get_mut(&self.channel_id.to_string()) {
                             entry.session_id = None;
-                            let _ = config.save().await;
+                            if let Err(e) = config.save().await {
+                                error!("❌ Failed to clear expired session id: {}", e);
+                            }
                         }
                         let _ = self.event_tx.send(AgentEvent::AgentEnd {
                             success: false,
                             error: Some("Session expired. Please retry.".into()),
                         });
                         anyhow::bail!("Session expired (404)");
-                    } else {
-                        let _ = self.event_tx.send(AgentEvent::Error {
-                            message: err_msg.clone(),
-                        });
                     }
-                    
+
+                    let body = resp.text().await.unwrap_or_default();
+                    let err_msg = if body.trim().is_empty() {
+                        format!("API Error {}", status)
+                    } else {
+                        format!("API Error {}: {}", status, body.trim())
+                    };
+                    error!("⚠️ [ATTEMPT {}/{} FAIL]: {}", attempt, max_retries, err_msg);
+                    last_error_message = Some(err_msg);
+
                     if attempt < max_retries {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(retry_delay).await;
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "⚠️ [ATTEMPT {}/{} FAIL]: {}. Retrying in 2s...",
-                        attempt, max_retries, e
-                    );
+                    let err_msg = e.to_string();
+                    error!("⚠️ [ATTEMPT {}/{} FAIL]: {}", attempt, max_retries, err_msg);
+                    last_error_message = Some(err_msg);
                     if attempt < max_retries {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    } else {
-                        last_err = Some(e);
+                        tokio::time::sleep(retry_delay).await;
                     }
                 }
             }
         }
 
-        // --- 診斷開始：事後現場 (僅在最後一次重試失敗後執行) ---
-        if let Some(e) = last_err {
-            let port = self.base_url.split(':').last().unwrap_or("0");
-            error!("🚨 [PROMPT-FINAL-FAIL]: {}. Analyzing process state...", e);
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "ps aux | grep opencode | grep -v grep; lsof -i :{}; uptime",
-                    port
-                ))
-                .output()
-                .map(|out| {
-                    error!(
-                        "📋 [FINAL-SNAPSHOT]:\n{}",
-                        String::from_utf8_lossy(&out.stdout)
-                    );
-                });
-            return Err(e.into());
+        if let Some(err_msg) = last_error_message {
+            let _ = self.event_tx.send(AgentEvent::Error {
+                message: err_msg.clone(),
+            });
+            anyhow::bail!(err_msg);
         }
         anyhow::bail!("Prompt failed after all retries")
     }
@@ -421,7 +403,9 @@ impl AiAgent for OpencodeAgent {
             let mut config = crate::commands::agent::ChannelConfig::load().await?;
             if let Some(entry) = config.channels.get_mut(&self.channel_id.to_string()) {
                 entry.session_id = None;
-                let _ = config.save().await;
+                if let Err(e) = config.save().await {
+                    error!("❌ Failed to clear missing session id: {}", e);
+                }
             }
         }
         Ok(AgentState {
@@ -436,7 +420,9 @@ impl AiAgent for OpencodeAgent {
         if let Some(entry) = config.channels.get_mut(&self.channel_id.to_string()) {
             entry.model_provider = Some(provider.into());
             entry.model_id = Some(mid.into());
-            let _ = config.save().await;
+            if let Err(e) = config.save().await {
+                error!("❌ Failed to persist model selection: {}", e);
+            }
         }
         Ok(())
     }
@@ -486,7 +472,7 @@ impl AiAgent for OpencodeAgent {
             .send()
             .await?;
         let val: Value = resp.json().await?;
-        let connected: Vec<String> = val["connected"]
+        let connected: HashSet<String> = val["connected"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -498,7 +484,7 @@ impl AiAgent for OpencodeAgent {
         if let Some(all) = val["all"].as_array() {
             for p in all {
                 let pid = p["id"].as_str().unwrap_or("");
-                if !connected.contains(&pid.to_string()) {
+                if !connected.contains(pid) {
                     continue;
                 }
                 if let Some(m_map) = p["models"].as_object() {
@@ -531,12 +517,33 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn build_test_agent(
+        mock_server: &MockServer,
+        api_key: &str,
+        session_id: &str,
+    ) -> (OpencodeAgent, broadcast::Receiver<AgentEvent>) {
+        let (event_tx, _) = broadcast::channel(100);
+        let rx = event_tx.subscribe();
+        let agent = OpencodeAgent {
+            client: reqwest::Client::new(),
+            api_key: api_key.to_string(),
+            base_url: mock_server.uri(),
+            session_id: session_id.to_string(),
+            channel_id: 1,
+            event_tx,
+            current_model: Arc::new(Mutex::new(None)),
+            turn_failed: Arc::new(AtomicBool::new(false)),
+            agent_type_name: "opencode",
+        };
+        (agent, rx)
+    }
+
     #[tokio::test]
     async fn test_opencode_retry_logic() -> anyhow::Result<()> {
         let mock_server = MockServer::start().await;
         let api_key = "test_key".to_string();
         let session_id = "test_session".to_string();
-        
+
         // 模擬 3 次 500 錯誤，然後第 4 次成功 (但我們只會重試 3 次)
         // 注意：測試邏輯是嘗試 1..=3，所以如果 3 次都失敗，最終應該回傳 Err。
         Mock::given(method("POST"))
@@ -546,23 +553,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let (event_tx, _) = broadcast::channel(100);
-        let agent = OpencodeAgent {
-            client: reqwest::Client::new(),
-            api_key: api_key.clone(),
-            base_url: mock_server.uri(),
-            session_id: session_id.clone(),
-            channel_id: 1,
-            event_tx,
-            current_model: Arc::new(Mutex::new(None)),
-            turn_failed: Arc::new(AtomicBool::new(false)),
-            agent_type_name: "opencode",
-        };
+        let (agent, mut rx) = build_test_agent(&mock_server, &api_key, &session_id);
 
         let result = agent.prompt("Hello").await;
-        
+
         // 斷言：最終應該失敗，因為 3 次重試都拿到了 500
         assert!(result.is_err());
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await??;
+        assert!(matches!(event, AgentEvent::Error { .. }));
         // Mock server 會在 drop 時驗證是否真的呼叫了 3 次
         Ok(())
     }
@@ -572,35 +570,39 @@ mod tests {
         let mock_server = MockServer::start().await;
         let api_key = "test_key".to_string();
         let session_id = "test_session".to_string();
-        
-        // 第 1 次 500，第 2 次 200
-        // Wiremock 優先匹配最後一個 mounted 的，所以我們先 mount 200，再 mount 500 (限一次)
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&mock_server)
-            .await;
 
+        // 第 1 次 500，第 2 次 200，兩次請求都應命中 /session/{id}/message
         Mock::given(method("POST"))
+            .and(path(format!("/session/{}/message", session_id)))
             .respond_with(ResponseTemplate::new(500))
             .up_to_n_times(1)
+            .expect(1)
             .mount(&mock_server)
             .await;
 
-        let (event_tx, _) = broadcast::channel(100);
-        let agent = OpencodeAgent {
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: mock_server.uri(),
-            session_id,
-            channel_id: 1,
-            event_tx,
-            current_model: Arc::new(Mutex::new(None)),
-            turn_failed: Arc::new(AtomicBool::new(false)),
-            agent_type_name: "opencode",
-        };
+        Mock::given(method("POST"))
+            .and(path(format!("/session/{}/message", session_id)))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (agent, mut rx) = build_test_agent(&mock_server, &api_key, &session_id);
 
         let result = agent.prompt("Hello").await;
         assert!(result.is_ok());
+        let no_error = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                match rx.recv().await {
+                    Ok(AgentEvent::Error { .. }) => return false,
+                    Ok(_) => continue,
+                    Err(_) => return true,
+                }
+            }
+        })
+        .await
+        .is_err();
+        assert!(no_error);
         Ok(())
     }
 }

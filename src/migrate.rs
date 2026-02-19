@@ -1,5 +1,5 @@
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::info;
 
@@ -93,7 +93,7 @@ async fn write_version(path: &PathBuf, version: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn migrate_config_only(old_dir: &PathBuf, new_dir: &PathBuf) -> anyhow::Result<()> {
+async fn migrate_config_only(old_dir: &Path, new_dir: &Path) -> anyhow::Result<()> {
     // 只遷移 config.toml 中的 token
     let old_config = old_dir.join("config.toml");
     let new_config = new_dir.join("config.toml");
@@ -119,7 +119,7 @@ async fn migrate_config_only(old_dir: &PathBuf, new_dir: &PathBuf) -> anyhow::Re
     Ok(())
 }
 
-async fn migrate_auth_and_sessions(old_dir: &PathBuf, new_dir: &PathBuf) -> anyhow::Result<()> {
+async fn migrate_auth_and_sessions(old_dir: &Path, new_dir: &Path) -> anyhow::Result<()> {
     // 遷移認證資料
     let old_registry = old_dir.join("registry.json");
     let new_auth = new_dir.join("auth.json");
@@ -224,7 +224,7 @@ async fn migrate_auth_and_sessions(old_dir: &PathBuf, new_dir: &PathBuf) -> anyh
     Ok(())
 }
 
-async fn migrate_v0_to_v1(old_dir: &PathBuf, new_dir: &PathBuf) -> anyhow::Result<()> {
+async fn migrate_v0_to_v1(old_dir: &Path, new_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(&new_dir).await?;
     fs::create_dir_all(new_dir.join("sessions").join("pi")).await?;
     fs::create_dir_all(new_dir.join("sessions").join("opencode")).await?;
@@ -288,7 +288,9 @@ pub fn get_base_dir() -> PathBuf {
     #[cfg(test)]
     {
         // 測試模式下禁止使用真實目錄，強制讓未隔離的測試崩潰
-        panic!("FATAL: Test tried to access real data directory! Use a temporary directory instead.");
+        panic!(
+            "FATAL: Test tried to access real data directory! Use a temporary directory instead."
+        );
     }
     #[cfg(not(test))]
     {

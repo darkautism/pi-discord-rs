@@ -138,14 +138,24 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentType;
+    use crate::agent::{AiAgent, MockAgent};
 
     #[tokio::test]
-    async fn test_session_manager_separation() {
+    async fn test_remove_session_clears_cached_agent() {
         let config = Arc::new(Config::default());
         let manager = SessionManager::new(config);
-        
-        // Mock a backend manager (it's hard to mock fully, but we can check the cache logic)
-        // This won't run fully since it calls external APIs, but we test the structure.
+        let channel_id = 42_u64;
+        let mock_agent: Arc<dyn AiAgent> = Arc::new(MockAgent::new());
+
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert(channel_id, mock_agent);
+            assert!(sessions.contains_key(&channel_id));
+        }
+
+        manager.remove_session(channel_id).await;
+
+        let sessions = manager.sessions.read().await;
+        assert!(!sessions.contains_key(&channel_id));
     }
 }

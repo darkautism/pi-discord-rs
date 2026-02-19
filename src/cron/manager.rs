@@ -12,7 +12,7 @@ use std::sync::Weak;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct CronJobInfo {
-    pub id: Uuid,             // 這是我們自定義的 ID，用於索引
+    pub id: Uuid, // 這是我們自定義的 ID，用於索引
     #[serde(default)]
     pub scheduler_id: Option<Uuid>, // 這是排程器產生的內部 ID，用於移除
     pub channel_id: u64,
@@ -38,10 +38,7 @@ impl CronManager {
 
     pub async fn with_config_dir(config_dir: PathBuf) -> anyhow::Result<Self> {
         let scheduler = JobScheduler::new().await?;
-        // 確保 Scheduler 已經啟動
-        if let Err(e) = scheduler.start().await {
-            error!("❌ Failed to start cron scheduler: {}", e);
-        }
+        scheduler.start().await?;
 
         let _ = std::fs::create_dir_all(&config_dir);
 
@@ -73,10 +70,13 @@ impl CronManager {
                 error!("❌ Failed to re-register job {}: {}", id, e);
             }
         }
-        
+
         let local_now = chrono::Local::now();
         let utc_now = chrono::Utc::now();
-        info!("📅 CronManager initialized. Local: {}, UTC: {}", local_now, utc_now);
+        info!(
+            "📅 CronManager initialized. Local: {}, UTC: {}",
+            local_now, utc_now
+        );
     }
 
     pub async fn add_job(&self, mut info: CronJobInfo) -> anyhow::Result<Uuid> {
@@ -205,12 +205,14 @@ impl CronManager {
     }
 
     pub async fn remove_job(&self, id: Uuid) -> anyhow::Result<()> {
-        let mut jobs = self.jobs.lock().await;
-        if let Some(info) = jobs.remove(&id) {
-            if let Some(s_id) = info.scheduler_id {
-                self.scheduler.remove(&s_id).await?;
-                info!("🗑️ Removed cron job {} (scheduler id: {})", id, s_id);
-            }
+        let removed_scheduler_id = {
+            let mut jobs = self.jobs.lock().await;
+            jobs.remove(&id).and_then(|info| info.scheduler_id)
+        };
+
+        if let Some(s_id) = removed_scheduler_id {
+            self.scheduler.remove(&s_id).await?;
+            info!("🗑️ Removed cron job {} (scheduler id: {})", id, s_id);
         }
 
         self.save_to_disk().await?;
@@ -221,30 +223,34 @@ impl CronManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
+
+    async fn new_test_manager(dir: &TempDir) -> anyhow::Result<CronManager> {
+        CronManager::with_config_dir(dir.path().to_path_buf()).await
+    }
+
+    fn build_job(job_id: Uuid, channel_id: u64, prompt: &str) -> CronJobInfo {
+        CronJobInfo {
+            id: job_id,
+            scheduler_id: None,
+            channel_id,
+            cron_expr: "0 * * * * *".to_string(),
+            prompt: prompt.to_string(),
+            creator_id: 1,
+            description: "test".to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn test_cron_persistence() -> anyhow::Result<()> {
         let dir = tempdir()?;
-        let manager = CronManager {
-            scheduler: JobScheduler::new().await?,
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            config_dir: dir.path().to_path_buf(),
-            http: Arc::new(Mutex::new(None)),
-            state: Arc::new(Mutex::new(None)),
-        };
-        manager.scheduler.start().await?;
+        let manager = new_test_manager(&dir).await?;
 
         let job_id = Uuid::new_v4();
-        let info = CronJobInfo {
-            id: job_id,
-            scheduler_id: None,
-            channel_id: 12345,
-            cron_expr: "0 0 * * * *".to_string(), // Every hour
-            prompt: "Test Prompt".to_string(),
-            creator_id: 67890,
-            description: "Test Description".to_string(),
-        };
+        let mut info = build_job(job_id, 12345, "Test Prompt");
+        info.cron_expr = "0 0 * * * *".to_string();
+        info.creator_id = 67890;
+        info.description = "Test Description".to_string();
 
         // Add job
         manager.add_job(info).await?;
@@ -254,86 +260,62 @@ mod tests {
         assert!(path.exists());
 
         // Create a new manager instance to load
-        let manager2 = CronManager {
-            scheduler: JobScheduler::new().await?,
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            config_dir: dir.path().to_path_buf(),
-            http: Arc::new(Mutex::new(None)),
-            state: Arc::new(Mutex::new(None)),
-        };
+        let manager2 = new_test_manager(&dir).await?;
         manager2.load_from_disk().await?;
 
         let jobs = manager2.jobs.lock().await;
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs.get(&job_id).unwrap().prompt, "Test Prompt");
+        let loaded = jobs.get(&job_id).expect("job should be persisted");
+        assert_eq!(loaded.prompt, "Test Prompt");
+        assert!(loaded.scheduler_id.is_some());
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_cron_trigger_logic() -> anyhow::Result<()> {
+    async fn test_remove_job_updates_memory_and_disk() -> anyhow::Result<()> {
         let dir = tempdir()?;
-        let manager = CronManager::with_config_dir(dir.path().to_path_buf()).await?;
-        
-        // Mock 任務資料
+        let manager = new_test_manager(&dir).await?;
         let job_id = Uuid::new_v4();
-        let channel_id = 99999u64;
-        let info = CronJobInfo {
-            id: job_id,
-            scheduler_id: None,
-            channel_id,
-            cron_expr: "1/1 * * * * *".to_string(), // 每秒觸發
-            prompt: "Test Trigger".to_string(),
-            creator_id: 111,
-            description: "Test".to_string(),
-        };
+        let mut info = build_job(job_id, 99999u64, "Test Trigger");
+        info.cron_expr = "1/1 * * * * *".to_string();
+        info.creator_id = 111;
 
-        // 驗證 add_job 能正確生成 scheduler_id
-        let added_id = manager.add_job(info).await?;
-        assert_eq!(added_id, job_id);
+        manager.add_job(info).await?;
+        manager.remove_job(job_id).await?;
 
         let jobs = manager.jobs.lock().await;
-        assert!(jobs.get(&job_id).unwrap().scheduler_id.is_some());
+        assert!(!jobs.contains_key(&job_id));
+        drop(jobs);
+
+        let manager2 = new_test_manager(&dir).await?;
+        manager2.load_from_disk().await?;
+        let jobs2 = manager2.jobs.lock().await;
+        assert!(!jobs2.contains_key(&job_id));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_cron_flow_verification() -> anyhow::Result<()> {
-        use crate::agent::{AiAgent, MockAgent, AgentEvent};
+    async fn test_get_jobs_for_channel_filters_correctly() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let manager = new_test_manager(&dir).await?;
+        let channel_a = 11111_u64;
+        let channel_b = 22222_u64;
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
 
-        // 1. Setup Mock Environment
-        let agent = Arc::new(MockAgent::new());
-        let (tx_verify, mut rx_verify) = tokio::sync::mpsc::channel(1);
+        manager.add_job(build_job(id_a, channel_a, "A")).await?;
+        let mut job_b = build_job(id_b, channel_b, "B");
+        job_b.creator_id = 2;
+        manager.add_job(job_b).await?;
 
-        // 模擬 start_agent_loop 的簡化行為用於測試驗證
-        let channel_id_to_check = 88888u64;
-        let prompt_to_check = "Hello, Cron!".to_string();
-        
-        let agent_clone = agent.clone();
-        tokio::spawn(async move {
-            let mut rx = agent_clone.subscribe_events();
-            agent_clone.prompt(&prompt_to_check).await.unwrap();
-            
-            while let Ok(event) = rx.recv().await {
-                match event {
-                    AgentEvent::MessageUpdate { ref text, .. } => {
-                        let _ = tx_verify.send((channel_id_to_check, text.clone())).await;
-                    }
-                    AgentEvent::AgentEnd { .. } => break,
-                    _ => {}
-                }
-            }
-        });
-
-        // 2. Verify Output
-        if let Ok(Some((cid, text))) = tokio::time::timeout(std::time::Duration::from_secs(2), rx_verify.recv()).await {
-            assert_eq!(cid, 88888);
-            assert_eq!(text, "Mock Response");
-            info!("✅ Integration flow verified: Channel={}, Text={}", cid, text);
-        } else {
-            anyhow::bail!("Flow verification timed out or failed");
-        }
+        let jobs_a = manager.get_jobs_for_channel(channel_a).await;
+        assert_eq!(jobs_a.len(), 1);
+        assert_eq!(jobs_a[0].id, id_a);
+        let jobs_b = manager.get_jobs_for_channel(channel_b).await;
+        assert_eq!(jobs_b.len(), 1);
+        assert_eq!(jobs_b[0].id, id_b);
 
         Ok(())
     }

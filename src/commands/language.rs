@@ -59,7 +59,9 @@ impl SlashCommand for LanguageCommand {
             // 為了簡化，我們先確保內存生效。
             let config_path = crate::migrate::get_config_path();
             let toml_str = toml::to_string_pretty(&config)?;
-            let _ = tokio::fs::write(config_path, toml_str).await;
+            if let Err(e) = tokio::fs::write(config_path, toml_str).await {
+                error!("❌ Failed to persist language setting: {}", e);
+            }
         }
 
         let msg = {

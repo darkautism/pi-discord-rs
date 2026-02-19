@@ -2,7 +2,6 @@ use super::SlashCommand;
 use async_trait::async_trait;
 use serenity::all::{CommandInteraction, Context, EditInteractionResponse};
 
-
 pub struct AbortCommand;
 
 #[async_trait]

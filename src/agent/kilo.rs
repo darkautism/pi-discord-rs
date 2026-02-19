@@ -75,12 +75,3 @@ impl AiAgent for KiloAgent {
         "kilo"
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn test_kilo_wrapper_type() {
-        // 驗證封裝後的類型標籤正確
-        // 由於 new 需要網路，這裡只測試靜態介面
-    }
-}

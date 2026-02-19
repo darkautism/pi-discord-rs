@@ -281,8 +281,12 @@ impl PiAgent {
                 }
                 if let Some(msgs) = val.get("messages").and_then(|m| m.as_array()) {
                     // 修正：提取最後一條使用者訊息之後的所有內容，而不只是最後一條助理訊息
-                    let user_idx = msgs.iter().rposition(|m| m["role"] == "user").unwrap_or(0);
-                    let current_turn = &msgs[user_idx + 1..];
+                    let current_turn_start = msgs
+                        .iter()
+                        .rposition(|m| m["role"] == "user")
+                        .map(|idx| idx + 1)
+                        .unwrap_or(0);
+                    let current_turn = msgs.get(current_turn_start..).unwrap_or(&[]);
 
                     let mut items = Vec::new();
                     for msg in current_turn {
@@ -498,10 +502,19 @@ impl Drop for PiAgent {
 mod tests {
     use super::*;
 
+    fn setup_parser_test() -> (
+        broadcast::Sender<AgentEvent>,
+        broadcast::Receiver<AgentEvent>,
+        Arc<Mutex<String>>,
+    ) {
+        let (tx, rx) = broadcast::channel(10);
+        let pending = Arc::new(Mutex::new(String::new()));
+        (tx, rx, pending)
+    }
+
     #[tokio::test]
     async fn test_parse_event_text_delta() {
-        let (tx, mut rx) = broadcast::channel(10);
-        let pending = Arc::new(Mutex::new(String::new()));
+        let (tx, mut rx, pending) = setup_parser_test();
         let val = json!({
             "type": "text_delta",
             "delta": "hello "
@@ -515,8 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_event_thinking_delta() {
-        let (tx, mut rx) = broadcast::channel(10);
-        let pending = Arc::new(Mutex::new(String::new()));
+        let (tx, mut rx, pending) = setup_parser_test();
         let val = json!({
             "type": "thinking_delta",
             "delta": "deep logic"
@@ -529,13 +541,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_event_trace_interception() {
-        let (tx, mut rx) = broadcast::channel(10);
-        let pending = Arc::new(Mutex::new(String::new()));
-        
+        let (tx, mut rx, pending) = setup_parser_test();
+
         // 模擬 AI 開始輸出 Trace 標記
         let val1 = json!({ "type": "text_delta", "delta": "I will run →" });
         PiAgent::parse_event(&tx, val1, &pending).await;
-        
+
         // 預期 "I will run " 被發出，而 "→" 被攔截進 pending
         if let AgentEvent::MessageUpdate { text, .. } = rx.recv().await.unwrap() {
             assert_eq!(text, "I will run ");
@@ -558,8 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_event_content_sync() {
-        let (tx, mut rx) = broadcast::channel(10);
-        let pending = Arc::new(Mutex::new(String::new()));
+        let (tx, mut rx, pending) = setup_parser_test();
         let val = json!({
             "type": "message_update",
             "partial": {
@@ -578,9 +588,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parse_event_agent_end_with_empty_messages() {
+        let (tx, mut rx, pending) = setup_parser_test();
+        let val = json!({
+            "type": "agent_end",
+            "messages": []
+        });
+        PiAgent::parse_event(&tx, val, &pending).await;
+        if let AgentEvent::AgentEnd { success, error } = rx.recv().await.unwrap() {
+            assert!(success);
+            assert!(error.is_none());
+        } else {
+            panic!("Wrong event");
+        }
+    }
+
+    #[tokio::test]
     async fn test_parse_event_tool_id_extraction() {
-        let (tx, mut rx) = broadcast::channel(10);
-        let pending = Arc::new(Mutex::new(String::new()));
+        let (tx, mut rx, pending) = setup_parser_test();
         let val =
             json!({ "type": "tool_execution_start", "toolCallId": "id-99", "toolName": "bash" });
         PiAgent::parse_event(&tx, val, &pending).await;
