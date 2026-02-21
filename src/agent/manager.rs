@@ -1,5 +1,9 @@
 use crate::agent::AgentType;
 use std::collections::HashMap;
+use std::fs;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,38 +29,92 @@ impl BackendManager {
         }
     }
 
+    fn detect_home_dir() -> Option<String> {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return Some(home);
+            }
+        }
+        dirs::home_dir().map(|p| p.to_string_lossy().to_string())
+    }
+
     fn collect_candidate_bin_dirs() -> Vec<String> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/kautism".to_string());
         let mut dirs = vec![
-            format!("{}/.npm-global/bin", home),
-            format!("{}/.opencode/bin", home),
-            format!("{}/.local/bin", home),
-            format!("{}/.volta/bin", home),
             "/usr/local/bin".to_string(),
             "/usr/bin".to_string(),
             "/snap/bin".to_string(),
         ];
 
+        let home = Self::detect_home_dir();
+        if let Some(home) = home.as_deref() {
+            dirs.push(format!("{}/.npm-global/bin", home));
+            dirs.push(format!("{}/.opencode/bin", home));
+            dirs.push(format!("{}/.local/bin", home));
+            dirs.push(format!("{}/.volta/bin", home));
+        }
+
         if let Ok(nvm_bin) = std::env::var("NVM_BIN") {
             dirs.push(nvm_bin);
         }
 
-        let nvm_dir = std::env::var("NVM_DIR").unwrap_or_else(|_| format!("{}/.nvm", home));
-        let node_versions_dir = Path::new(&nvm_dir).join("versions").join("node");
-        if let Ok(entries) = std::fs::read_dir(node_versions_dir) {
-            let mut version_bins = Vec::new();
-            for entry in entries.flatten() {
-                let p = entry.path().join("bin");
-                if p.is_dir() {
-                    version_bins.push(p.to_string_lossy().to_string());
+        if let Some(home) = home {
+            let nvm_dir = std::env::var("NVM_DIR").unwrap_or_else(|_| format!("{}/.nvm", home));
+            let node_versions_dir = Path::new(&nvm_dir).join("versions").join("node");
+            if let Ok(entries) = std::fs::read_dir(node_versions_dir) {
+                let mut version_bins = Vec::new();
+                for entry in entries.flatten() {
+                    let p = entry.path().join("bin");
+                    if p.is_dir() {
+                        version_bins.push(p.to_string_lossy().to_string());
+                    }
                 }
+                version_bins.sort();
+                version_bins.reverse();
+                dirs.extend(version_bins);
             }
-            version_bins.sort();
-            version_bins.reverse();
-            dirs.extend(version_bins);
         }
 
         dirs
+    }
+
+    pub(crate) fn is_candidate_runnable(path: &Path) -> bool {
+        let Ok(meta) = fs::metadata(path) else {
+            return false;
+        };
+        if !meta.is_file() {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            if meta.permissions().mode() & 0o111 == 0 {
+                return false;
+            }
+        }
+
+        // Try to detect broken shebang interpreters (common ENOENT cause for npm shims).
+        let mut file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return true,
+        };
+        let mut buf = [0_u8; 256];
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return true,
+        };
+        let head = String::from_utf8_lossy(&buf[..n]);
+        if let Some(line) = head.lines().next() {
+            if let Some(shebang) = line.strip_prefix("#!") {
+                let mut parts = shebang.split_whitespace();
+                if let Some(interpreter) = parts.next() {
+                    let interpreter = interpreter.trim();
+                    if interpreter.starts_with('/') && !Path::new(interpreter).exists() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub(crate) fn resolve_binary_path(bin: &str) -> String {
@@ -66,7 +124,7 @@ impl BackendManager {
 
         for dir in Self::collect_candidate_bin_dirs() {
             let candidate = Path::new(&dir).join(bin);
-            if candidate.exists() {
+            if Self::is_candidate_runnable(&candidate) {
                 return candidate.to_string_lossy().to_string();
             }
         }

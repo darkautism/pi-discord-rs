@@ -714,7 +714,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Version) => println!("v{}", env!("CARGO_PKG_VERSION")),
         Some(Commands::Daemon { action }) => {
             let service_path = dirs::config_dir()
-                .unwrap()
+                .or_else(dirs::home_dir)
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine config/home directory"))?
                 .join("systemd")
                 .join("user")
                 .join("agent-discord-rs.service");
@@ -722,10 +723,7 @@ async fn main() -> anyhow::Result<()> {
             match action {
                 DaemonAction::Enable => {
                     // 1. 偵測目前執行檔路徑
-                    let exe_path = std::env::current_exe()?
-                        .to_str()
-                        .unwrap_or("/home/kautism/.cargo/bin/agent-discord")
-                        .to_string();
+                    let exe_path = std::env::current_exe()?.to_string_lossy().to_string();
 
                     // 2. 偵測時區
                     let tz = std::fs::read_to_string("/etc/timezone")
@@ -734,9 +732,6 @@ async fn main() -> anyhow::Result<()> {
                         .to_string();
 
                     // 3. 取得目前環境變數
-                    let pi_binary = std::env::var("PI_BINARY").unwrap_or_else(|_| {
-                        agent::manager::BackendManager::resolve_binary_path("pi")
-                    });
                     let current_path = std::env::var("PATH").unwrap_or_default();
                     let augmented_path =
                         agent::manager::BackendManager::build_augmented_path(&current_path);
@@ -749,7 +744,6 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={} run
-Environment="PI_BINARY={}"
 Environment="PATH={}"
 Environment="TZ={}"
 Restart=on-failure
@@ -758,7 +752,7 @@ RestartSec=5s
 [Install]
 WantedBy=default.target
 "#,
-                        exe_path, pi_binary, augmented_path, tz
+                        exe_path, augmented_path, tz
                     );
 
                     std::fs::create_dir_all(service_path.parent().unwrap())?;

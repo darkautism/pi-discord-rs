@@ -3,6 +3,7 @@ use crate::agent::manager::BackendManager;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -51,7 +52,9 @@ impl CopilotRuntime {
 
     async fn spawn() -> anyhow::Result<Arc<Self>> {
         let copilot_bin = std::env::var("COPILOT_BINARY")
-            .unwrap_or_else(|_| BackendManager::resolve_binary_path("copilot"));
+            .ok()
+            .filter(|v| BackendManager::is_candidate_runnable(Path::new(v)))
+            .unwrap_or_else(|| BackendManager::resolve_binary_path("copilot"));
         let current_path = std::env::var("PATH").unwrap_or_default();
         let mut cmd = Command::new(&copilot_bin);
         cmd.arg("--acp")

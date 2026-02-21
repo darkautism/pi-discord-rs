@@ -2,6 +2,7 @@ use super::{AgentEvent, AgentState, AiAgent, ContentItem, ContentType, ModelInfo
 use crate::agent::manager::BackendManager;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,7 +23,9 @@ impl PiAgent {
     pub async fn new(channel_id: u64, session_dir: &PathBuf) -> anyhow::Result<(Arc<Self>, u64)> {
         std::fs::create_dir_all(session_dir)?;
         let pi_binary = std::env::var("PI_BINARY")
-            .unwrap_or_else(|_| BackendManager::resolve_binary_path("pi"));
+            .ok()
+            .filter(|v| BackendManager::is_candidate_runnable(Path::new(v)))
+            .unwrap_or_else(|| BackendManager::resolve_binary_path("pi"));
 
         info!("🚀 Spawning Pi binary: {}", pi_binary);
         let session_file = session_dir.join(format!("discord-rs-{}.jsonl", channel_id));
