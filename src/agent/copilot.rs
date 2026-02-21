@@ -1,8 +1,8 @@
 use super::{AgentEvent, AgentState, AiAgent, ModelInfo};
+use crate::agent::manager::BackendManager;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -36,32 +36,6 @@ struct CopilotRuntime {
 }
 
 impl CopilotRuntime {
-    fn resolve_binary_path(bin: &str) -> String {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/kautism".to_string());
-        let paths = vec![
-            format!("{}/.npm-global/bin/{}", home, bin),
-            format!("{}/.opencode/bin/{}", home, bin),
-            format!("{}/.local/bin/{}", home, bin),
-            format!("/usr/local/bin/{}", bin),
-            format!("/usr/bin/{}", bin),
-        ];
-        for path in paths {
-            if Path::new(&path).exists() {
-                return path;
-            }
-        }
-        bin.to_string()
-    }
-
-    fn build_augmented_path() -> String {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/kautism".to_string());
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        format!(
-            "{}/.npm-global/bin:{}/.local/bin:{}/.opencode/bin:{}",
-            home, home, home, current_path
-        )
-    }
-
     async fn get() -> anyhow::Result<Arc<Self>> {
         let runtime = COPILOT_RUNTIME
             .get_or_try_init(|| async {
@@ -76,14 +50,15 @@ impl CopilotRuntime {
     }
 
     async fn spawn() -> anyhow::Result<Arc<Self>> {
-        let copilot_bin =
-            std::env::var("COPILOT_BINARY").unwrap_or_else(|_| Self::resolve_binary_path("copilot"));
+        let copilot_bin = std::env::var("COPILOT_BINARY")
+            .unwrap_or_else(|_| BackendManager::resolve_binary_path("copilot"));
+        let current_path = std::env::var("PATH").unwrap_or_default();
         let mut cmd = Command::new(&copilot_bin);
         cmd.arg("--acp")
             .arg("--allow-all-tools")
             .arg("--allow-all-paths")
             .arg("--allow-all-urls")
-            .env("PATH", Self::build_augmented_path())
+            .env("PATH", BackendManager::build_augmented_path(&current_path))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

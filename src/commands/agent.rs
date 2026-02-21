@@ -32,7 +32,7 @@ pub fn build_backend_error_message(
 
     if is_binary_not_found(error_text) {
         let install_cmd = match agent_type {
-            AgentType::Pi => "npm install -g pi-coding-agent",
+            AgentType::Pi => "npm install -g @mariozechner/pi-coding-agent",
             AgentType::Opencode => "npm install -g @opencode-ai/cli",
             AgentType::Kilo => "npm install -g @kilocode/cli",
             AgentType::Copilot => "npm install -g @github/copilot",
@@ -95,7 +95,7 @@ pub struct ChannelEntry {
     #[serde(default)]
     pub mention_only: bool,
     // 通用 Session ID，不再區分 kilo 或 opencode
-    #[serde(rename = "kilo_session_id")]
+    #[serde(default, alias = "kilo_session_id")]
     pub session_id: Option<String>,
     pub model_provider: Option<String>,
     pub model_id: Option<String>,
@@ -305,7 +305,7 @@ pub async fn handle_button(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_backend_error_message, is_binary_not_found};
+    use super::{build_backend_error_message, is_binary_not_found, ChannelEntry};
     use crate::agent::AgentType;
     use crate::i18n::I18n;
 
@@ -335,5 +335,23 @@ mod tests {
         let msg = build_backend_error_message(&i18n, AgentType::Opencode, "connection refused", 4096);
         assert!(msg.contains("opencode serve --port 4096"));
         assert!(msg.contains("Failed to start opencode backend"));
+    }
+
+    #[test]
+    fn test_channel_entry_supports_legacy_kilo_session_id_alias() {
+        let legacy = r#"{
+            "agent_type":"kilo",
+            "authorized_at":"2025-01-01T00:00:00Z",
+            "mention_only":true,
+            "kilo_session_id":"sid-legacy",
+            "model_provider":null,
+            "model_id":null
+        }"#;
+        let entry: ChannelEntry = serde_json::from_str(legacy).expect("legacy json should parse");
+        assert_eq!(entry.session_id.as_deref(), Some("sid-legacy"));
+
+        let serialized = serde_json::to_string(&entry).expect("serialize");
+        assert!(serialized.contains("\"session_id\""));
+        assert!(!serialized.contains("\"kilo_session_id\""));
     }
 }

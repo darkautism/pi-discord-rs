@@ -30,7 +30,7 @@ A high-performance Discord bot daemon in Rust that bridges multiple coding-agent
 1. Rust toolchain: <https://www.rust-lang.org/tools/install>
 2. Discord bot token
 3. At least one backend installed:
-   - Pi: <https://github.com/mariozechner/pi-coding-agent>
+   - Pi: `npm install -g @mariozechner/pi-coding-agent` (<https://github.com/mariozechner/pi-coding-agent>)
    - OpenCode: `npm install -g @opencode-ai/cli`
    - Kilo: `npm install -g @kilocode/cli`
    - Copilot CLI (ACP): `npm install -g @github/copilot` (or your distro package)

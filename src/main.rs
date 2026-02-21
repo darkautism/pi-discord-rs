@@ -734,8 +734,12 @@ async fn main() -> anyhow::Result<()> {
                         .to_string();
 
                     // 3. 取得目前環境變數
-                    let pi_binary = std::env::var("PI_BINARY")
-                        .unwrap_or_else(|_| "/home/kautism/.npm-global/bin/pi".to_string());
+                    let pi_binary = std::env::var("PI_BINARY").unwrap_or_else(|_| {
+                        agent::manager::BackendManager::resolve_binary_path("pi")
+                    });
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    let augmented_path =
+                        agent::manager::BackendManager::build_augmented_path(&current_path);
 
                     let service_content = format!(
                         r#"[Unit]
@@ -746,6 +750,7 @@ After=network.target
 Type=simple
 ExecStart={} run
 Environment="PI_BINARY={}"
+Environment="PATH={}"
 Environment="TZ={}"
 Restart=on-failure
 RestartSec=5s
@@ -753,7 +758,7 @@ RestartSec=5s
 [Install]
 WantedBy=default.target
 "#,
-                        exe_path, pi_binary, tz
+                        exe_path, pi_binary, augmented_path, tz
                     );
 
                     std::fs::create_dir_all(service_path.parent().unwrap())?;
