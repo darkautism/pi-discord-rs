@@ -618,6 +618,12 @@ impl EventHandler for Handler {
                 tokio::spawn(async move {
                     let _ = commands::cron::handle_modal_submit(&ctx, &modal, &state).await;
                 });
+            } else if custom_id == "config_assistant_modal" {
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    let _ = commands::config::handle_assistant_modal_submit(&ctx, &modal, &state)
+                        .await;
+                });
             }
         } else if let Interaction::Component(component) = interaction {
             let custom_id = component.data.custom_id.as_str();

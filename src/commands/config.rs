@@ -1,11 +1,14 @@
 use super::SlashCommand;
 use async_trait::async_trait;
 use serenity::all::{
-    CommandInteraction, Context, CreateActionRow, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, EditInteractionResponse,
+    ActionRowComponent, CommandInteraction, Context, CreateActionRow, CreateInputText,
+    CreateInteractionResponse, CreateModal, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, EditInteractionResponse, InputTextStyle, ModalInteraction,
 };
 
 use crate::agent::AgentType;
+
+const ASSISTANT_NAME_MAX_CHARS: usize = 48;
 
 pub struct ConfigCommand;
 
@@ -90,10 +93,7 @@ impl SlashCommand for ConfigCommand {
             CreateSelectMenuKind::String {
                 options: vec![
                     CreateSelectMenuOption::new(i18n.get("config_assistant_default"), "default"),
-                    CreateSelectMenuOption::new("Agent", "Agent"),
-                    CreateSelectMenuOption::new("Assistant", "Assistant"),
-                    CreateSelectMenuOption::new("Coder", "Coder"),
-                    CreateSelectMenuOption::new("Analyst", "Analyst"),
+                    CreateSelectMenuOption::new(i18n.get("config_assistant_custom"), "custom"),
                 ],
             },
         )
@@ -118,13 +118,40 @@ impl SlashCommand for ConfigCommand {
     }
 }
 
+fn sanitize_assistant_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Strip control chars/backticks and neutralize mention marker.
+    let mut out = String::new();
+    for ch in trimmed.chars() {
+        if ch.is_control() || ch == '`' {
+            continue;
+        }
+        if ch == '@' {
+            out.push('@');
+            out.push('\u{200B}');
+            continue;
+        }
+        out.push(ch);
+    }
+
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        return None;
+    }
+
+    let final_name: String = out.chars().take(ASSISTANT_NAME_MAX_CHARS).collect();
+    Some(final_name)
+}
+
 pub async fn handle_config_select(
     ctx: &Context,
     interaction: &serenity::all::ComponentInteraction,
     state: &crate::AppState,
 ) -> anyhow::Result<()> {
-    interaction.defer_ephemeral(&ctx.http).await?;
-
     let custom_id = interaction.data.custom_id.as_str();
     let value = match &interaction.data.kind {
         serenity::all::ComponentInteractionDataKind::StringSelect { values } => {
@@ -138,6 +165,41 @@ pub async fn handle_config_select(
 
     let channel_id_u64 = interaction.channel_id.get();
     let channel_id_str = interaction.channel_id.to_string();
+
+    if custom_id == "config_assistant_select" && value == "custom" {
+        let channel_config = crate::commands::agent::ChannelConfig::load()
+            .await
+            .unwrap_or_default();
+        let current = channel_config
+            .channels
+            .get(&channel_id_str)
+            .and_then(|e| e.assistant_name.clone())
+            .unwrap_or_else(|| state.config.assistant_name.clone());
+
+        let i18n = state.i18n.read().await;
+        let modal = CreateModal::new(
+            "config_assistant_modal",
+            i18n.get("config_assistant_modal_title"),
+        )
+        .components(vec![CreateActionRow::InputText(
+            CreateInputText::new(
+                InputTextStyle::Short,
+                i18n.get("config_assistant_modal_label"),
+                "assistant_name",
+            )
+            .placeholder(i18n.get("config_assistant_modal_hint"))
+            .value(current)
+            .required(true)
+            .max_length(ASSISTANT_NAME_MAX_CHARS as u16),
+        )]);
+
+        interaction
+            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+            .await?;
+        return Ok(());
+    }
+
+    interaction.defer_ephemeral(&ctx.http).await?;
 
     match custom_id {
         "config_backend_select" => {
@@ -203,22 +265,13 @@ pub async fn handle_config_select(
                 channel_config.get_agent_type(&channel_id_str),
             );
             if let Some(entry) = channel_config.channels.get_mut(&channel_id_str) {
-                entry.assistant_name = if value == "default" {
-                    None
-                } else {
-                    Some(value.clone())
-                };
+                entry.assistant_name = None;
             }
             channel_config.save().await?;
 
             let msg = {
                 let i18n = state.i18n.read().await;
-                let chosen = if value == "default" {
-                    state.config.assistant_name.clone()
-                } else {
-                    value
-                };
-                i18n.get_args("config_assistant_set", &[chosen])
+                i18n.get_args("config_assistant_set", &[state.config.assistant_name.clone()])
             };
 
             interaction
@@ -229,4 +282,81 @@ pub async fn handle_config_select(
     }
 
     Ok(())
+}
+
+pub async fn handle_assistant_modal_submit(
+    ctx: &Context,
+    interaction: &ModalInteraction,
+    state: &crate::AppState,
+) -> anyhow::Result<()> {
+    interaction.defer_ephemeral(&ctx.http).await?;
+
+    let mut raw = String::new();
+    for row in &interaction.data.components {
+        for component in &row.components {
+            if let ActionRowComponent::InputText(text) = component {
+                if text.custom_id == "assistant_name" {
+                    raw = text.value.clone().unwrap_or_default();
+                }
+            }
+        }
+    }
+
+    let Some(safe_name) = sanitize_assistant_name(&raw) else {
+        let msg = {
+            let i18n = state.i18n.read().await;
+            i18n.get("config_assistant_invalid")
+        };
+        interaction
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(msg))
+            .await?;
+        return Ok(());
+    };
+
+    let channel_id = interaction.channel_id.to_string();
+    let mut channel_config = crate::commands::agent::ChannelConfig::load()
+        .await
+        .unwrap_or_default();
+    channel_config.set_agent_type(&channel_id, channel_config.get_agent_type(&channel_id));
+    if let Some(entry) = channel_config.channels.get_mut(&channel_id) {
+        entry.assistant_name = Some(safe_name.clone());
+    }
+    channel_config.save().await?;
+
+    let msg = {
+        let i18n = state.i18n.read().await;
+        i18n.get_args("config_assistant_set", &[safe_name])
+    };
+
+    interaction
+        .edit_response(&ctx.http, EditInteractionResponse::new().content(msg))
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_assistant_name;
+
+    #[test]
+    fn test_sanitize_assistant_name_strips_controls_and_limits_length() {
+        let input = "  bad`name\n@everyone\u{0007}  ";
+        let got = sanitize_assistant_name(input).unwrap_or_default();
+        assert!(!got.contains('`'));
+        assert!(!got.contains('\n'));
+        assert!(got.contains("@\u{200B}everyone"));
+    }
+
+    #[test]
+    fn test_sanitize_assistant_name_rejects_empty() {
+        assert!(sanitize_assistant_name("   \n\t").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_assistant_name_accepts_cjk() {
+        let input = "測試助手名稱-中文";
+        let got = sanitize_assistant_name(input).unwrap_or_default();
+        assert_eq!(got, input);
+    }
 }

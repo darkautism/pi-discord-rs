@@ -1,93 +1,136 @@
 # Agent Discord (Rust)
 
-A high-performance Discord Bot daemon developed in Rust, designed to bridge and manage multiple AI Agent backends.
+A high-performance Discord bot daemon in Rust that bridges multiple coding-agent backends with a unified channel workflow.
 
 ## Core Features
 
-- **Multi-backend Integration**: Unified interface for managing Pi (CLI), OpenCode (API), Kilo (API), and Copilot (ACP) backends.
-- **Real-time State Rendering**: Synchronized display of AI reasoning streams and tool execution (Tool Use) status.
-- **Session Lifecycle Management**: Dynamic backend switching, model selection, thinking level configuration, and command-based context compression (`/compact`).
-- **I18n Support**: Seamless switching between Traditional Chinese (zh-TW) and English (en), with automatic re-registration of Slash Commands to update localized descriptions.
+- Multi-backend routing: Pi (RPC), OpenCode, Kilo, and Copilot.
+- Per-channel config: backend, mention-only mode, and assistant display name via `/config`.
+- File upload pipeline: attachments are staged locally, passed to backends with native/fallback handling, and auto-cleaned by TTL.
+- Real-time streaming UI: thinking/tool status + incremental response rendering.
+- Session lifecycle control: model switching, thinking level, compact/clear/abort.
+- i18n: Traditional Chinese (`zh-TW`) and English (`en`).
 
-## Commands (Slash Commands)
+## Slash Commands
 
-- `/agent`: Switch the active AI Agent backend.
-- `/model`: Switch the AI model used in the current channel.
-- `/thinking`: Set the AI thinking depth (subject to model capability).
-- `/compact`: Manually trigger context compression to save tokens.
-- `/language`: Switch the bot interface language.
-- `/clear`: Completely wipe current session state and local JSONL history.
-- `/mention_only`: Toggle whether to respond only when mentioned (@).
+- `/config`: Configure non-sensitive per-channel settings (backend, mention_only, assistant name).
+- `/agent`: Switch backend for current channel.
+- `/model`: Switch model for current channel.
+- `/thinking`: Set thinking level (if backend supports it).
+- `/compact`: Compact conversation context.
+- `/clear`: Clear current session state.
+- `/abort`: Abort current generation.
+- `/skill`: Load a skill (backend-dependent).
+- `/mention_only`: Toggle mention-only mode.
+- `/language`: Switch bot UI language.
+- `/cron`, `/cron_list`: Manage scheduled prompts.
 
-## Deployment
+## Requirements
 
-### Prerequisites
+1. Rust toolchain: <https://www.rust-lang.org/tools/install>
+2. Discord bot token
+3. At least one backend installed:
+   - Pi: <https://github.com/mariozechner/pi-coding-agent>
+   - OpenCode: `npm install -g @opencode-ai/cli`
+   - Kilo: `npm install -g @kilocode/cli`
+   - Copilot CLI (ACP): `npm install -g @github/copilot` (or your distro package)
 
-1.  **Rust Toolchain**: Install via [rust-lang.org](https://www.rust-lang.org/tools/install).
-2.  **Discord Bot Token**:
-    -   Create an application at the [Discord Developer Portal](https://discord.com/developers/applications).
-    -   Under **Bot**, enable the following **Privileged Gateway Intents**:
-        -   `Presence Intent` (Optional)
-        -   `Server Members Intent`
-        -   `Message Content Intent` (Required)
-3.  **AI Backends**: Install at least one of the following:
-    -   **Pi**: [github.com/mariozechner/pi-coding-agent](https://github.com/mariozechner/pi-coding-agent)
-    -   **OpenCode**: `npm install -g @opencode-ai/cli`
-    -   **Kilo**: `npm install -g @kilocode/cli`
-    -   **Copilot**: `copilot` (ACP backend, bot-managed lifecycle)
+## Discord Setup
 
-### Installation
+### Gateway Intents
 
-Install via [crates.io](https://crates.io/crates/agent-discord-rs):
+Enable these in Discord Developer Portal -> Bot:
+
+- Required:
+  - `MESSAGE CONTENT INTENT`
+- Recommended:
+  - `SERVER MEMBERS INTENT`
+- Optional:
+  - `PRESENCE INTENT`
+
+### OAuth2 Scopes
+
+- `bot`
+- `applications.commands`
+
+### Bot Permissions (recommended baseline)
+
+Grant at least:
+
+- `View Channels`
+- `Send Messages`
+- `Send Messages in Threads`
+- `Embed Links`
+- `Attach Files`
+- `Read Message History`
+- `Use Application Commands`
+
+Optional but useful for broader server setups:
+
+- `Manage Messages`
+- `Add Reactions`
+- `Use External Emojis`
+
+## Install
+
+From crates.io:
+
 ```bash
 cargo install agent-discord-rs
 ```
 
 Or build from source:
+
 ```bash
 git clone https://github.com/darkautism/pi-discord-rs.git
 cd pi-discord-rs
 cargo install --path .
 ```
 
-### Initial Setup
+## First Run
 
-1.  **Generate Config**: Run the bot for the first time to create the default config directory:
-    ```bash
-    agent-discord run
-    ```
-2.  **Edit Config**: Locate `config.toml` (typically in `~/.config/agent-discord-rs/config.toml`) and paste your `discord_token`.
-3.  **Authentication**:
-    -   Invite the bot to your server.
-    -   **Mention (@) the bot in a channel** to trigger the authentication prompt.
-    -   Follow the instructions and run:
-      ```bash
-      agent-discord auth <TOKEN_FROM_DISCORD>
-      ```
-4.  **Copilot one-time login (if using Copilot backend)**:
-    ```bash
-    copilot login
-    ```
-
-### Running the Bot
+1. Start once to generate config/data files:
 
 ```bash
-# Start the bot
+agent-discord run
+```
+
+2. Edit config at:
+
+```text
+~/.agent-discord-rs/config.toml
+```
+
+Set at minimum:
+
+- `discord_token`
+- optional `assistant_name`
+
+3. Authorize channel/user:
+
+- Mention the bot in target channel.
+- Run returned auth command:
+
+```bash
+agent-discord auth <TOKEN_FROM_DISCORD>
+```
+
+4. If using Copilot backend, login once with the same Linux account as the bot service:
+
+```bash
+copilot login
+```
+
+## Run
+
+```bash
+# foreground
 agent-discord run
 
-# Background daemon (Linux/Systemd)
+# systemd user service
 agent-discord daemon enable
 ```
 
-## Acknowledgments
-
-This project relies on the following backends for its AI capabilities. Special thanks to the developers:
-
-- **[Pi](https://github.com/mariozechner/pi-coding-agent)**: The core for local automation and RPC calls.
-- **OpenCode**: A robust HTTP/SSE backend with full tool-calling support.
-- **Kilo**: A specialized backend implementation optimized for long-running sessions.
-- **Copilot**: ACP backend support for GitHub Copilot workflows with bot-managed lifecycle.
-
 ## License
 
-This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+MIT. See `LICENSE`.
