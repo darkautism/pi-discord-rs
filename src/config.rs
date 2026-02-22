@@ -75,3 +75,57 @@ port = 4096
         Ok(config)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use crate::migrate::BASE_DIR_ENV;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn test_load_creates_default_config_when_missing() {
+        let _guard = env_lock().lock().expect("lock");
+        let dir = tempdir().expect("tempdir");
+        // SAFETY: serialized by env lock
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+        let err = Config::load().await.expect_err("first load should create default and fail");
+        assert!(err.to_string().contains("Configuration file not found"));
+        assert!(dir.path().join("config.toml").exists());
+        // SAFETY: serialized by env lock
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+    }
+
+    #[tokio::test]
+    async fn test_load_reads_existing_config() {
+        let _guard = env_lock().lock().expect("lock");
+        let dir = tempdir().expect("tempdir");
+        // SAFETY: serialized by env lock
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"discord_token = "abc"
+debug_level = "INFO"
+language = "en"
+assistant_name = "AgentX"
+
+[opencode]
+host = "127.0.0.1"
+port = 4096
+"#,
+        )
+        .await
+        .expect("write config");
+        let cfg = Config::load().await.expect("load");
+        assert_eq!(cfg.discord_token, "abc");
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.assistant_name, "AgentX");
+        // SAFETY: serialized by env lock
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+    }
+}

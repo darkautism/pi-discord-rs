@@ -32,10 +32,10 @@ pub fn build_backend_error_message(
 
     if is_binary_not_found(error_text) {
         let install_cmd = match agent_type {
-            AgentType::Pi => "npm install -g @mariozechner/pi-coding-agent",
-            AgentType::Opencode => "npm install -g @opencode-ai/cli",
-            AgentType::Kilo => "npm install -g @kilocode/cli",
-            AgentType::Copilot => "npm install -g @github/copilot",
+            AgentType::Pi => "npm i -g @mariozechner/pi-coding-agent",
+            AgentType::Opencode => "npm i -g opencode-ai@latest",
+            AgentType::Kilo => "npm i -g @kilocode/cli",
+            AgentType::Copilot => "npm i -g @github/copilot",
         };
         return format!(
             "{}\n\n{}:\n```bash\n{}\n```",
@@ -305,7 +305,7 @@ pub async fn handle_button(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_backend_error_message, is_binary_not_found, ChannelEntry};
+    use super::{build_backend_error_message, is_binary_not_found, ChannelConfig, ChannelEntry};
     use crate::agent::AgentType;
     use crate::i18n::I18n;
 
@@ -353,5 +353,61 @@ mod tests {
         let serialized = serde_json::to_string(&entry).expect("serialize");
         assert!(serialized.contains("\"session_id\""));
         assert!(!serialized.contains("\"kilo_session_id\""));
+    }
+
+    #[test]
+    fn test_backend_error_message_for_pi_runtime_hint() {
+        let i18n = I18n::new("en");
+        let msg = build_backend_error_message(&i18n, AgentType::Pi, "runtime error", 4096);
+        assert!(msg.contains("Failed to start pi backend"));
+        assert!(msg.contains("PI_BINARY"));
+    }
+
+    #[test]
+    fn test_backend_error_message_for_copilot_auth_hint() {
+        let i18n = I18n::new("en");
+        let msg = build_backend_error_message(&i18n, AgentType::Copilot, "not authenticated", 0);
+        assert!(msg.contains("Copilot is managed by the bot"));
+        assert!(msg.contains("copilot login"));
+    }
+
+    #[test]
+    fn test_channel_config_set_agent_type_creates_entry_with_defaults() {
+        let mut cfg = ChannelConfig::default();
+        cfg.set_agent_type("123", AgentType::Opencode);
+
+        let entry = cfg.channels.get("123").expect("entry");
+        assert_eq!(entry.agent_type, AgentType::Opencode);
+        assert!(entry.mention_only);
+        assert!(entry.session_id.is_none());
+        assert!(entry.assistant_name.is_none());
+        assert!(!entry.authorized_at.is_empty());
+    }
+
+    #[test]
+    fn test_backend_error_message_for_kilo_has_start_command() {
+        let i18n = I18n::new("en");
+        let msg = build_backend_error_message(&i18n, AgentType::Kilo, "connection refused", 7777);
+        assert!(msg.contains("kilo serve --port 7777"));
+    }
+
+    #[test]
+    fn test_backend_error_message_for_copilot_runtime_hint_branch() {
+        let i18n = I18n::new("en");
+        let msg = build_backend_error_message(&i18n, AgentType::Copilot, "broken pipe", 0);
+        assert!(msg.contains("Copilot is managed by the bot"));
+        assert!(msg.contains("copilot --version"));
+    }
+
+    #[test]
+    fn test_backend_error_message_missing_binary_commands_for_all_backends() {
+        let i18n = I18n::new("en");
+        let e = "ENOENT";
+        let pi = build_backend_error_message(&i18n, AgentType::Pi, e, 0);
+        let copilot = build_backend_error_message(&i18n, AgentType::Copilot, e, 0);
+        let kilo = build_backend_error_message(&i18n, AgentType::Kilo, e, 0);
+        assert!(pi.contains("@mariozechner/pi-coding-agent"));
+        assert!(copilot.contains("@github/copilot"));
+        assert!(kilo.contains("@kilocode/cli"));
     }
 }

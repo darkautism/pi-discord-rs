@@ -203,6 +203,7 @@ pub mod kilo;
 pub mod manager;
 pub mod opencode;
 pub mod pi;
+pub mod runtime;
 pub use copilot::CopilotAgent;
 pub use kilo::KiloAgent;
 pub use opencode::OpencodeAgent;

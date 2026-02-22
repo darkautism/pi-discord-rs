@@ -12,6 +12,26 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+#[derive(Debug, Clone, PartialEq)]
+enum RealtimeEventAction {
+    MessageUpdate {
+        thinking: String,
+        text: String,
+        id: Option<String>,
+    },
+    ToolStart {
+        id: String,
+        name: String,
+    },
+    ToolUpdate {
+        id: String,
+        output: String,
+    },
+    TurnCompleted,
+    Error(String),
+    Ignore,
+}
+
 pub struct OpencodeAgent {
     client: reqwest::Client,
     api_key: String,
@@ -189,114 +209,143 @@ impl OpencodeAgent {
             info!("📡 SSE Event: type={}", type_);
         }
 
+        match Self::parse_realtime_event(&val) {
+            RealtimeEventAction::MessageUpdate { thinking, text, id } => {
+                let _ = self.event_tx.send(AgentEvent::MessageUpdate {
+                    thinking,
+                    text,
+                    is_delta: true,
+                    id,
+                });
+            }
+            RealtimeEventAction::ToolStart { id, name } => {
+                let _ = self.event_tx.send(AgentEvent::ToolExecutionStart { id, name });
+            }
+            RealtimeEventAction::ToolUpdate { id, output } => {
+                let _ = self.event_tx.send(AgentEvent::ToolExecutionUpdate { id, output });
+            }
+            RealtimeEventAction::TurnCompleted => {
+                info!("🏁 Turn completed signal received: {}", type_);
+                if !self.turn_failed.load(Ordering::SeqCst) {
+                    self.trigger_sync().await;
+                }
+            }
+            RealtimeEventAction::Error(msg) => {
+                error!("❌ FULL ERROR JSON: {}", val);
+                error!("❌ Backend Error Summary: {}", msg);
+                self.turn_failed.store(true, Ordering::SeqCst);
+                let _ = self.event_tx.send(AgentEvent::AgentEnd {
+                    success: false,
+                    error: Some(msg),
+                });
+            }
+            RealtimeEventAction::Ignore => {}
+        }
+    }
+
+    fn parse_realtime_event(val: &Value) -> RealtimeEventAction {
+        let type_ = val["type"].as_str().unwrap_or("");
         let properties = &val["properties"];
         let data = &val["data"];
 
         match type_ {
             "message.part.updated" | "message.part.delta" | "session.message.part.delta" => {
-                let part_info = if properties["part"].is_object() {
-                    &properties["part"]
-                } else {
-                    data
-                };
-                let part_type = part_info["type"]
-                    .as_str()
-                    .or(properties["type"].as_str())
-                    .unwrap_or("text");
-                let part_id = part_info["id"]
-                    .as_str()
-                    .or(properties["partID"].as_str())
-                    .map(|s| s.to_string());
-                let delta = properties["delta"]
-                    .as_str()
-                    .or(data["delta"].as_str())
-                    .unwrap_or("");
-
-                // 核心過濾：只允許 assistant 角色或正在思考的內容
-                let role = properties["messageRole"]
-                    .as_str()
-                    .or(data["messageRole"].as_str())
-                    .or(properties["role"].as_str())
-                    .or(data["role"].as_str())
-                    .or(part_info["role"].as_str())
-                    .unwrap_or("");
-
-                // 如果明確是 system/user 角色且不是思考，就跳過
-                if (role == "system" || role == "user")
-                    && !part_type.contains("reason")
-                    && !part_type.contains("think")
-                {
-                    return;
-                }
-
-                if part_type.contains("reason") || part_type.contains("think") {
-                    let _ = self.event_tx.send(AgentEvent::MessageUpdate {
-                        thinking: delta.into(),
-                        text: "".into(),
-                        is_delta: true,
-                        id: part_id,
-                    });
-                } else if part_type.contains("tool") || part_type == "agent" {
-                    let id = part_id.unwrap_or_else(|| "tool".into());
-                    let status = part_info["state"]["status"].as_str().unwrap_or("");
-                    if status == "running" || status == "pending" {
-                        let name = part_info["tool"].as_str().unwrap_or("tool");
-                        let cmd = part_info["state"]["input"]["command"]
-                            .as_str()
-                            .unwrap_or("");
-                        let _ = self.event_tx.send(AgentEvent::ToolExecutionStart {
-                            id,
-                            name: format!("🛠️ `{}`: `{}`", name, cmd),
-                        });
-                    } else if status == "completed" {
-                        let output = part_info["state"]["metadata"]["output"]
-                            .as_str()
-                            .or(part_info["state"]["output"].as_str())
-                            .unwrap_or("");
-                        let _ = self.event_tx.send(AgentEvent::ToolExecutionUpdate {
-                            id,
-                            output: output.into(),
-                        });
-                    }
-                } else {
-                    let _ = self.event_tx.send(AgentEvent::MessageUpdate {
-                        thinking: "".into(),
-                        text: delta.into(),
-                        is_delta: true,
-                        id: part_id,
-                    });
-                }
+                Self::parse_delta_event(properties, data)
             }
             "session.turn.close"
             | "session.message.completed"
             | "turn.close"
             | "message.completed"
             | "turn.end"
-            | "session.idle" => {
-                info!("🏁 Turn completed signal received: {}", type_);
-                if !self.turn_failed.load(Ordering::SeqCst) {
-                    self.trigger_sync().await;
-                }
-            }
+            | "session.idle" => RealtimeEventAction::TurnCompleted,
             "session.error" | "error" => {
-                error!("❌ FULL ERROR JSON: {}", val);
-
-                // 嘗試從嵌套結構中提取最有用的錯誤訊息
-                let msg = properties["error"]["data"]["message"]
-                    .as_str()
-                    .or(properties["message"].as_str())
-                    .or(data["message"].as_str())
-                    .unwrap_or("Unknown Error");
-
-                error!("❌ Backend Error Summary: {}", msg);
-                self.turn_failed.store(true, Ordering::SeqCst);
-                let _ = self.event_tx.send(AgentEvent::AgentEnd {
-                    success: false,
-                    error: Some(msg.into()),
-                });
+                let msg = Self::extract_error_message(properties, data);
+                RealtimeEventAction::Error(msg)
             }
-            _ => {}
+            _ => RealtimeEventAction::Ignore,
         }
+    }
+
+    fn parse_delta_event(properties: &Value, data: &Value) -> RealtimeEventAction {
+        let part_info = if properties["part"].is_object() {
+            &properties["part"]
+        } else {
+            data
+        };
+        let part_type = part_info["type"]
+            .as_str()
+            .or(properties["type"].as_str())
+            .unwrap_or("text");
+        let part_id = part_info["id"]
+            .as_str()
+            .or(properties["partID"].as_str())
+            .map(|s| s.to_string());
+        let delta = properties["delta"]
+            .as_str()
+            .or(data["delta"].as_str())
+            .unwrap_or("");
+
+        let role = properties["messageRole"]
+            .as_str()
+            .or(data["messageRole"].as_str())
+            .or(properties["role"].as_str())
+            .or(data["role"].as_str())
+            .or(part_info["role"].as_str())
+            .unwrap_or("");
+
+        if (role == "system" || role == "user")
+            && !part_type.contains("reason")
+            && !part_type.contains("think")
+        {
+            return RealtimeEventAction::Ignore;
+        }
+
+        if part_type.contains("reason") || part_type.contains("think") {
+            return RealtimeEventAction::MessageUpdate {
+                thinking: delta.into(),
+                text: "".into(),
+                id: part_id,
+            };
+        }
+
+        if part_type.contains("tool") || part_type == "agent" {
+            let id = part_id.unwrap_or_else(|| "tool".into());
+            let status = part_info["state"]["status"].as_str().unwrap_or("");
+            if status == "running" || status == "pending" {
+                let name = part_info["tool"].as_str().unwrap_or("tool");
+                let cmd = part_info["state"]["input"]["command"].as_str().unwrap_or("");
+                return RealtimeEventAction::ToolStart {
+                    id,
+                    name: format!("🛠️ `{}`: `{}`", name, cmd),
+                };
+            }
+            if status == "completed" {
+                let output = part_info["state"]["metadata"]["output"]
+                    .as_str()
+                    .or(part_info["state"]["output"].as_str())
+                    .unwrap_or("");
+                return RealtimeEventAction::ToolUpdate {
+                    id,
+                    output: output.into(),
+                };
+            }
+            return RealtimeEventAction::Ignore;
+        }
+
+        RealtimeEventAction::MessageUpdate {
+            thinking: "".into(),
+            text: delta.into(),
+            id: part_id,
+        }
+    }
+
+    fn extract_error_message(properties: &Value, data: &Value) -> String {
+        properties["error"]["data"]["message"]
+            .as_str()
+            .or(properties["message"].as_str())
+            .or(data["message"].as_str())
+            .unwrap_or("Unknown Error")
+            .to_string()
     }
 
     async fn trigger_sync(&self) {
@@ -570,8 +619,18 @@ impl AiAgent for OpencodeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{UploadedFile, UserInput};
+    use crate::migrate::BASE_DIR_ENV;
+    use serde_json::json;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
 
     fn build_test_agent(
         mock_server: &MockServer,
@@ -660,5 +719,442 @@ mod tests {
         .is_err();
         assert!(no_error);
         Ok(())
+    }
+
+    #[test]
+    fn test_parse_realtime_event_thinking_delta() {
+        let v = json!({
+            "type":"message.part.delta",
+            "properties":{
+                "part":{"type":"thinking","id":"p1","role":"assistant"},
+                "delta":"thinking..."
+            },
+            "data":{}
+        });
+        let got = OpencodeAgent::parse_realtime_event(&v);
+        assert_eq!(
+            got,
+            RealtimeEventAction::MessageUpdate {
+                thinking: "thinking...".to_string(),
+                text: "".to_string(),
+                id: Some("p1".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_realtime_event_text_delta_filters_user_role() {
+        let v = json!({
+            "type":"message.part.delta",
+            "properties":{
+                "part":{"type":"text","id":"p2","role":"user"},
+                "delta":"hello"
+            },
+            "data":{}
+        });
+        let got = OpencodeAgent::parse_realtime_event(&v);
+        assert_eq!(got, RealtimeEventAction::Ignore);
+    }
+
+    #[test]
+    fn test_parse_realtime_event_tool_start_and_update() {
+        let running = json!({
+            "type":"message.part.delta",
+            "properties":{
+                "part":{
+                    "type":"tool",
+                    "id":"t1",
+                    "tool":"bash",
+                    "state":{"status":"running","input":{"command":"ls"}}
+                }
+            },
+            "data":{}
+        });
+        let got_running = OpencodeAgent::parse_realtime_event(&running);
+        assert_eq!(
+            got_running,
+            RealtimeEventAction::ToolStart {
+                id: "t1".to_string(),
+                name: "🛠️ `bash`: `ls`".to_string()
+            }
+        );
+
+        let done = json!({
+            "type":"message.part.delta",
+            "properties":{
+                "part":{
+                    "type":"tool",
+                    "id":"t1",
+                    "state":{"status":"completed","metadata":{"output":"ok"}}
+                }
+            },
+            "data":{}
+        });
+        let got_done = OpencodeAgent::parse_realtime_event(&done);
+        assert_eq!(
+            got_done,
+            RealtimeEventAction::ToolUpdate {
+                id: "t1".to_string(),
+                output: "ok".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_realtime_event_turn_completed_and_error() {
+        let done = json!({"type":"turn.end"});
+        assert_eq!(
+            OpencodeAgent::parse_realtime_event(&done),
+            RealtimeEventAction::TurnCompleted
+        );
+
+        let err = json!({
+            "type":"error",
+            "properties":{"error":{"data":{"message":"boom"}}},
+            "data":{}
+        });
+        assert_eq!(
+            OpencodeAgent::parse_realtime_event(&err),
+            RealtimeEventAction::Error("boom".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_realtime_event_text_and_agent_tool_defaults() {
+        let text = json!({
+            "type":"message.part.updated",
+            "properties":{"part":{"type":"text","id":"m1","role":"assistant"},"delta":"hello"},
+            "data":{}
+        });
+        assert_eq!(
+            OpencodeAgent::parse_realtime_event(&text),
+            RealtimeEventAction::MessageUpdate {
+                thinking: "".to_string(),
+                text: "hello".to_string(),
+                id: Some("m1".to_string())
+            }
+        );
+
+        let tool = json!({
+            "type":"message.part.updated",
+            "properties":{"part":{"type":"agent","state":{"status":"pending","input":{"command":"pwd"}}}},
+            "data":{}
+        });
+        assert_eq!(
+            OpencodeAgent::parse_realtime_event(&tool),
+            RealtimeEventAction::ToolStart {
+                id: "tool".to_string(),
+                name: "🛠️ `tool`: `pwd`".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_realtime_event_tool_completed_uses_fallback_output() {
+        let done = json!({
+            "type":"message.part.updated",
+            "properties":{
+                "part":{
+                    "type":"tool",
+                    "id":"t9",
+                    "state":{"status":"completed","output":"fallback-out"}
+                }
+            },
+            "data":{}
+        });
+        assert_eq!(
+            OpencodeAgent::parse_realtime_event(&done),
+            RealtimeEventAction::ToolUpdate {
+                id: "t9".to_string(),
+                output: "fallback-out".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_extract_error_message_fallbacks() {
+        let properties = json!({"message":"p-msg"});
+        let data = json!({"message":"d-msg"});
+        assert_eq!(OpencodeAgent::extract_error_message(&properties, &data), "p-msg");
+
+        let properties2 = json!({});
+        assert_eq!(
+            OpencodeAgent::extract_error_message(&properties2, &data),
+            "d-msg"
+        );
+
+        let data2 = json!({});
+        assert_eq!(
+            OpencodeAgent::extract_error_message(&properties2, &data2),
+            "Unknown Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_parts_from_input_handles_inline_and_fallback() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let small_path = dir.path().join("a.txt");
+        tokio::fs::write(&small_path, b"hello").await?;
+
+        let input = UserInput {
+            text: "prompt".to_string(),
+            files: vec![UploadedFile {
+                id: "1".to_string(),
+                name: "a.txt".to_string(),
+                mime: "text/plain".to_string(),
+                size: 5,
+                local_path: small_path.to_string_lossy().to_string(),
+                source_url: "u".to_string(),
+            }],
+        };
+        let (text, parts) = OpencodeAgent::build_parts_from_input(&input).await;
+        assert!(text.contains("[Uploaded Files]"));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "file");
+        assert!(!parts[0]["data"].as_str().unwrap_or("").is_empty());
+
+        let input_large = UserInput {
+            text: "prompt2".to_string(),
+            files: vec![UploadedFile {
+                id: "2".to_string(),
+                name: "big.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                size: OpencodeAgent::MAX_INLINE_FILE_BYTES + 1,
+                local_path: "/tmp/not-read.bin".to_string(),
+                source_url: "u2".to_string(),
+            }],
+        };
+        let (text_large, parts_large) = OpencodeAgent::build_parts_from_input(&input_large).await;
+        assert!(text_large.contains("mode=fallback_path"));
+        assert!(parts_large.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_parts_from_input_image_uses_image_type() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let img_path = dir.path().join("a.png");
+        tokio::fs::write(&img_path, b"png-bytes").await?;
+        let input = UserInput {
+            text: "img".to_string(),
+            files: vec![UploadedFile {
+                id: "i1".to_string(),
+                name: "a.png".to_string(),
+                mime: "image/png".to_string(),
+                size: 9,
+                local_path: img_path.to_string_lossy().to_string(),
+                source_url: "u".to_string(),
+            }],
+        };
+        let (_text, parts) = OpencodeAgent::build_parts_from_input(&input).await;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "image");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_parts_from_input_missing_file_falls_back() -> anyhow::Result<()> {
+        let input = UserInput {
+            text: "missing".to_string(),
+            files: vec![UploadedFile {
+                id: "m1".to_string(),
+                name: "missing.txt".to_string(),
+                mime: "text/plain".to_string(),
+                size: 8,
+                local_path: "/tmp/definitely-not-exists-xyz.txt".to_string(),
+                source_url: "u".to_string(),
+            }],
+        };
+        let (text, parts) = OpencodeAgent::build_parts_from_input(&input).await;
+        assert!(text.contains("mode=fallback_path"));
+        assert!(parts.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_construct_message_body_contains_model_when_set() -> anyhow::Result<()> {
+        let input = UserInput::new_text("hello".to_string());
+        let body = OpencodeAgent::construct_message_body(
+            &input,
+            &Some(("openai".to_string(), "gpt-4.1".to_string())),
+        )
+        .await;
+        assert_eq!(body["model"]["providerID"], "openai");
+        assert_eq!(body["model"]["modelID"], "gpt-4.1");
+        assert_eq!(body["parts"][0]["type"], "text");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_construct_message_body_without_model() -> anyhow::Result<()> {
+        let input = UserInput::new_text("hello".to_string());
+        let body = OpencodeAgent::construct_message_body(&input, &None).await;
+        assert!(body.get("model").is_none());
+        assert_eq!(body["parts"][0]["text"], "hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_available_models_filters_connected_providers() -> anyhow::Result<()> {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "connected":["openai"],
+                "all":[
+                    {"id":"openai","models":{"gpt-4.1":{},"gpt-4o":{}}},
+                    {"id":"other","models":{"x":{}}}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (agent, _) = build_test_agent(&mock_server, "k", "sid");
+        let models = agent.get_available_models().await?;
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().all(|m| m.provider == "openai"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_available_models_empty_when_disconnected() -> anyhow::Result<()> {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "connected":[],
+                "all":[{"id":"openai","models":{"gpt-4.1":{}}}]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (agent, _) = build_test_agent(&mock_server, "k", "sid");
+        let models = agent.get_available_models().await?;
+        assert!(models.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_state_404_clears_sid() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir()?;
+        // SAFETY: serialized by env lock
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+
+        let mock_server_404 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/session/sid"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server_404)
+            .await;
+        let (agent_404, _) = build_test_agent(&mock_server_404, "k", "sid");
+        let state_404 = agent_404.get_state().await?;
+        assert_eq!(state_404.message_count, 0);
+        // SAFETY: serialized by env lock
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_model_persists_to_channel_config() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir()?;
+        // SAFETY: serialized by env lock
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        let (agent, _) = build_test_agent(&mock_server, "k", "sid");
+        agent.set_model("openai", "gpt-4.1").await?;
+        let model = agent.current_model.lock().await.clone();
+        assert_eq!(
+            model,
+            Some(("openai".to_string(), "gpt-4.1".to_string()))
+        );
+        // SAFETY: serialized by env lock
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_success_and_failure() -> anyhow::Result<()> {
+        let ok_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session/sid/message"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&ok_server)
+            .await;
+        let (ok_agent, _) = build_test_agent(&ok_server, "k", "sid");
+        ok_agent.compact().await?;
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session/sid/message"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&fail_server)
+            .await;
+        let (fail_agent, _) = build_test_agent(&fail_server, "k", "sid");
+        let err = fail_agent.compact().await.expect_err("compact must fail");
+        assert!(err.to_string().contains("Compact failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_abort_hits_endpoint() -> anyhow::Result<()> {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session/sid/abort"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let (agent, _) = build_test_agent(&mock_server, "k", "sid");
+        agent.abort().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_404_clears_sid_and_returns_err() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir()?;
+        // SAFETY: serialized by env lock
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session/sid/message"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let (agent, _) = build_test_agent(&mock_server, "k", "sid");
+        let err = agent.prompt("x").await.expect_err("expected 404 error");
+        assert!(err.to_string().contains("Session expired"));
+        // SAFETY: serialized by env lock
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_realtime_event_ignores_unknown_status_and_type() {
+        let unknown_status = json!({
+            "type":"message.part.delta",
+            "properties":{"part":{"type":"tool","state":{"status":"queued"}}},
+            "data":{}
+        });
+        assert_eq!(
+            OpencodeAgent::parse_realtime_event(&unknown_status),
+            RealtimeEventAction::Ignore
+        );
+
+        let unknown_type = json!({"type":"noop"});
+        assert_eq!(
+            OpencodeAgent::parse_realtime_event(&unknown_type),
+            RealtimeEventAction::Ignore
+        );
     }
 }

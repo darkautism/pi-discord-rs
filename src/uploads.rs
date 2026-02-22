@@ -233,3 +233,77 @@ fn guess_mime_from_name(name: &str) -> String {
     }
     "application/octet-stream".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn test_manager(root: PathBuf, ttl: Duration, cleanup_interval: Duration) -> UploadManager {
+        UploadManager {
+            client: reqwest::Client::new(),
+            root,
+            max_file_bytes: 1024 * 1024,
+            ttl,
+            cleanup_interval,
+            last_cleanup: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_filename_rewrites_invalid_chars() {
+        assert_eq!(sanitize_filename("..//測試?.png"), ".._____.png");
+        assert_eq!(sanitize_filename("!!!"), "file.bin");
+        assert_eq!(sanitize_filename("hello-world.txt"), "hello-world.txt");
+    }
+
+    #[test]
+    fn test_guess_mime_from_name_variants() {
+        assert_eq!(guess_mime_from_name("a.PNG"), "image/png");
+        assert_eq!(guess_mime_from_name("a.jpeg"), "image/jpeg");
+        assert_eq!(guess_mime_from_name("a.gif"), "image/gif");
+        assert_eq!(guess_mime_from_name("a.webp"), "image/webp");
+        assert_eq!(guess_mime_from_name("a.pdf"), "application/pdf");
+        assert_eq!(
+            guess_mime_from_name("unknown.bin"),
+            "application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_removes_old_files_and_empty_dirs() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("chan").join("date");
+        tokio::fs::create_dir_all(&nested).await.expect("mkdir");
+        tokio::fs::write(nested.join("old.txt"), "x")
+            .await
+            .expect("write");
+
+        let manager = test_manager(
+            dir.path().to_path_buf(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        manager.cleanup_expired().await.expect("cleanup");
+
+        assert!(is_dir_empty(dir.path()).await.expect("dir check"));
+    }
+
+    #[tokio::test]
+    async fn test_maybe_cleanup_respects_interval() {
+        let dir = tempdir().expect("tempdir");
+        let manager = test_manager(
+            dir.path().to_path_buf(),
+            Duration::from_secs(0),
+            Duration::from_secs(3600),
+        );
+
+        manager.maybe_cleanup().await;
+        let first = *manager.last_cleanup.lock().await;
+        assert!(first.is_some());
+        manager.maybe_cleanup().await;
+        let second = *manager.last_cleanup.lock().await;
+        assert_eq!(first, second);
+    }
+}

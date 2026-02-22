@@ -1,12 +1,9 @@
 use crate::agent::AgentType;
+use crate::agent::runtime;
 use std::collections::HashMap;
-use std::fs;
-use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -29,112 +26,24 @@ impl BackendManager {
         }
     }
 
-    fn detect_home_dir() -> Option<String> {
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.trim().is_empty() {
-                return Some(home);
-            }
-        }
-        dirs::home_dir().map(|p| p.to_string_lossy().to_string())
-    }
-
-    fn collect_candidate_bin_dirs() -> Vec<String> {
-        let mut dirs = vec![
-            "/usr/local/bin".to_string(),
-            "/usr/bin".to_string(),
-            "/snap/bin".to_string(),
-        ];
-
-        let home = Self::detect_home_dir();
-        if let Some(home) = home.as_deref() {
-            dirs.push(format!("{}/.npm-global/bin", home));
-            dirs.push(format!("{}/.opencode/bin", home));
-            dirs.push(format!("{}/.local/bin", home));
-            dirs.push(format!("{}/.volta/bin", home));
-        }
-
-        if let Ok(nvm_bin) = std::env::var("NVM_BIN") {
-            dirs.push(nvm_bin);
-        }
-
-        if let Some(home) = home {
-            let nvm_dir = std::env::var("NVM_DIR").unwrap_or_else(|_| format!("{}/.nvm", home));
-            let node_versions_dir = Path::new(&nvm_dir).join("versions").join("node");
-            if let Ok(entries) = std::fs::read_dir(node_versions_dir) {
-                let mut version_bins = Vec::new();
-                for entry in entries.flatten() {
-                    let p = entry.path().join("bin");
-                    if p.is_dir() {
-                        version_bins.push(p.to_string_lossy().to_string());
-                    }
+    fn spawn_stream_logger<R>(label: String, reader: R)
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut r = BufReader::new(reader);
+            let mut line = String::new();
+            while let Ok(n) = r.read_line(&mut line).await {
+                if n == 0 {
+                    break;
                 }
-                version_bins.sort();
-                version_bins.reverse();
-                dirs.extend(version_bins);
-            }
-        }
-
-        dirs
-    }
-
-    pub(crate) fn is_candidate_runnable(path: &Path) -> bool {
-        let Ok(meta) = fs::metadata(path) else {
-            return false;
-        };
-        if !meta.is_file() {
-            return false;
-        }
-
-        #[cfg(unix)]
-        {
-            if meta.permissions().mode() & 0o111 == 0 {
-                return false;
-            }
-        }
-
-        // Try to detect broken shebang interpreters (common ENOENT cause for npm shims).
-        let mut file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => return true,
-        };
-        let mut buf = [0_u8; 256];
-        let n = match file.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => return true,
-        };
-        let head = String::from_utf8_lossy(&buf[..n]);
-        if let Some(line) = head.lines().next() {
-            if let Some(shebang) = line.strip_prefix("#!") {
-                let mut parts = shebang.split_whitespace();
-                if let Some(interpreter) = parts.next() {
-                    let interpreter = interpreter.trim();
-                    if interpreter.starts_with('/') && !Path::new(interpreter).exists() {
-                        return false;
-                    }
+                let msg = line.trim();
+                if !msg.is_empty() {
+                    warn!("{}: {}", label, msg);
                 }
+                line.clear();
             }
-        }
-        true
-    }
-
-    pub(crate) fn resolve_binary_path(bin: &str) -> String {
-        if Path::new(bin).exists() {
-            return bin.to_string();
-        }
-
-        for dir in Self::collect_candidate_bin_dirs() {
-            let candidate = Path::new(&dir).join(bin);
-            if Self::is_candidate_runnable(&candidate) {
-                return candidate.to_string_lossy().to_string();
-            }
-        }
-        bin.to_string()
-    }
-
-    pub(crate) fn build_augmented_path(current_path: &str) -> String {
-        let mut all = Self::collect_candidate_bin_dirs();
-        all.push(current_path.to_string());
-        all.join(":")
+        });
     }
 
     fn get_free_port() -> u16 {
@@ -180,7 +89,16 @@ impl BackendManager {
             _ => return Err(anyhow::anyhow!("Unsupported agent type")),
         };
 
-        let resolved_path = Self::resolve_binary_path(bin_name);
+        let env_key = match agent_type {
+            AgentType::Opencode => "OPENCODE_BINARY",
+            AgentType::Kilo => "KILO_BINARY",
+            _ => "",
+        };
+        let resolved_path = if env_key.is_empty() {
+            runtime::resolve_binary_path(bin_name)
+        } else {
+            runtime::resolve_binary_with_env(env_key, bin_name)
+        };
         info!(
             "🚀 Starting {} on port {} from {}",
             agent_type, port, resolved_path
@@ -195,8 +113,10 @@ impl BackendManager {
             .env("NODE_OPTIONS", "--max-old-space-size=4096"); // 透過環境變數限制封裝後的 Node.js 內存
 
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = Self::build_augmented_path(&current_path);
+        let new_path = runtime::build_augmented_path(&current_path);
         cmd.env("PATH", new_path);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
         if let Some(password) = &self.config.opencode.password {
             if !password.is_empty() {
@@ -212,9 +132,15 @@ impl BackendManager {
             }
         }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Spawn failed: {}", e))?;
+        if let Some(stdout) = child.stdout.take() {
+            Self::spawn_stream_logger(format!("{}(stdout)", agent_type), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            Self::spawn_stream_logger(format!("{}(stderr)", agent_type), stderr);
+        }
         let process = Arc::new(BackendProcess {
             child: Mutex::new(child),
             port,
@@ -251,5 +177,29 @@ impl BackendManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendManager;
+    use crate::agent::AgentType;
+    use crate::config::Config;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_get_free_port_returns_non_zero() {
+        let p = BackendManager::get_free_port();
+        assert!(p > 0);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_backend_rejects_unsupported_agent_type() {
+        let manager = BackendManager::new(Arc::new(Config::default()));
+        let err = manager
+            .ensure_backend(&AgentType::Pi)
+            .await
+            .expect_err("pi should be unsupported in backend manager");
+        assert!(err.to_string().contains("Unsupported agent type"));
     }
 }

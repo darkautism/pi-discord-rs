@@ -12,6 +12,34 @@ use crate::i18n::I18n;
 
 pub struct CronCommand;
 
+fn normalize_freq(freq: &str) -> String {
+    let freq_parts: Vec<&str> = freq.split_whitespace().collect();
+    match freq_parts.len() {
+        1 => format!("{} * *", freq),
+        2 => format!("{} *", freq),
+        3 => freq.to_string(),
+        _ => "* * *".to_string(),
+    }
+}
+
+fn build_cron_expr(minute: &str, hour: &str, freq: &str) -> String {
+    format!("0 {} {} {}", minute, hour, normalize_freq(freq))
+}
+
+fn prompt_preview(prompt: &str, max_chars: usize) -> String {
+    if prompt.len() <= max_chars {
+        return prompt.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+    let mut end = max_chars - 3;
+    while !prompt.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!("{}...", &prompt[..end])
+}
+
 pub async fn handle_modal_submit(
     ctx: &Context,
     interaction: &ModalInteraction,
@@ -39,16 +67,7 @@ pub async fn handle_modal_submit(
     }
 
     // 構建 6 位 Cron: 秒(0) 分 時 日 月 週
-    // 如果 freq 只有一部分，補齊它
-    let freq_parts: Vec<&str> = freq.split_whitespace().collect();
-    let final_freq = match freq_parts.len() {
-        1 => format!("{} * *", freq), // 假設使用者只填了日期或星期
-        2 => format!("{} *", freq),
-        3 => freq.to_string(),
-        _ => "* * *".to_string(),
-    };
-
-    let cron_expr = format!("0 {} {} {}", minute, hour, final_freq);
+    let cron_expr = build_cron_expr(&minute, &hour, &freq);
 
     // 驗證並翻譯成「人話」
     let i18n = state.i18n.read().await;
@@ -241,15 +260,7 @@ impl SlashCommand for CronListCommand {
                     format!("{}: {}", job.cron_expr, job.description),
                     job.id.to_string(),
                 )
-                .description(if job.prompt.len() > 50 {
-                    let mut end = 47;
-                    while !job.prompt.is_char_boundary(end) && end > 0 {
-                        end -= 1;
-                    }
-                    format!("{}...", &job.prompt[..end])
-                } else {
-                    job.prompt.clone()
-                }),
+                .description(prompt_preview(&job.prompt, 50)),
             );
         }
 
@@ -271,5 +282,37 @@ impl SlashCommand for CronListCommand {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_cron_expr, normalize_freq, prompt_preview};
+
+    #[test]
+    fn test_normalize_freq_supports_1_2_3_parts() {
+        assert_eq!(normalize_freq("*"), "* * *");
+        assert_eq!(normalize_freq("* 1"), "* 1 *");
+        assert_eq!(normalize_freq("* * 1"), "* * 1");
+        assert_eq!(normalize_freq("* * * *"), "* * *");
+    }
+
+    #[test]
+    fn test_build_cron_expr_uses_6_field_format() {
+        assert_eq!(build_cron_expr("0", "8", "*"), "0 0 8 * * *");
+        assert_eq!(build_cron_expr("15", "9", "* * 1"), "0 15 9 * * 1");
+    }
+
+    #[test]
+    fn test_prompt_preview_truncates_on_char_boundary() {
+        let s = "這是一段很長的中文內容，會被安全截斷";
+        let out = prompt_preview(s, 14);
+        assert!(out.ends_with("..."));
+        assert!(out.len() <= 17);
+    }
+
+    #[test]
+    fn test_prompt_preview_short_string_unchanged() {
+        assert_eq!(prompt_preview("hello", 50), "hello");
     }
 }

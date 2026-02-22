@@ -6,6 +6,7 @@ use tracing::info;
 const CURRENT_VERSION: u32 = 1;
 const OLD_BASE_DIR: &str = ".pi/discord-rs";
 const NEW_BASE_DIR: &str = ".agent-discord-rs";
+pub const BASE_DIR_ENV: &str = "AGENT_DISCORD_BASE_DIR";
 
 pub async fn run_migrations() -> anyhow::Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
@@ -290,6 +291,12 @@ port = 4096
 }
 
 pub fn get_base_dir() -> PathBuf {
+    if let Ok(v) = std::env::var(BASE_DIR_ENV) {
+        if !v.trim().is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+
     #[cfg(test)]
     {
         // 測試模式下禁止使用真實目錄，強制讓未隔離的測試崩潰
@@ -323,4 +330,116 @@ pub fn get_prompts_dir() -> PathBuf {
 
 pub fn get_uploads_dir() -> PathBuf {
     get_base_dir().join("uploads")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_get_base_dir_uses_env_override() {
+        let _guard = env_lock().lock().expect("lock");
+        let dir = tempdir().expect("tempdir");
+        // SAFETY: tests serialize env writes via global mutex
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+        let got = get_base_dir();
+        assert_eq!(got, dir.path());
+        // SAFETY: tests serialize env writes via global mutex
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+    }
+
+    #[tokio::test]
+    async fn test_migrate_config_only_replaces_placeholder_token() {
+        let old = tempdir().expect("old");
+        let newd = tempdir().expect("new");
+        let old_cfg = old.path().join("config.toml");
+        let new_cfg = newd.path().join("config.toml");
+
+        fs::write(&old_cfg, "discord_token = \"REAL_TOKEN\"").await.expect("write old");
+        fs::write(
+            &new_cfg,
+            "discord_token = \"YOUR_DISCORD_TOKEN_HERE\"\nlanguage = \"zh-TW\"",
+        )
+        .await
+        .expect("write new");
+
+        migrate_config_only(old.path(), newd.path())
+            .await
+            .expect("migrate config");
+        let updated = fs::read_to_string(new_cfg).await.expect("read updated");
+        assert!(updated.contains("REAL_TOKEN"));
+        assert!(!updated.contains("YOUR_DISCORD_TOKEN_HERE"));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_auth_and_sessions_transfers_registry_sessions_and_prompts() {
+        let old = tempdir().expect("old");
+        let newd = tempdir().expect("new");
+
+        fs::create_dir_all(old.path().join("sessions"))
+            .await
+            .expect("mkdir sessions");
+        fs::create_dir_all(old.path().join("prompts"))
+            .await
+            .expect("mkdir prompts");
+        fs::write(old.path().join("sessions").join("s1.jsonl"), "abc")
+            .await
+            .expect("write session");
+        fs::write(old.path().join("prompts").join("p1.txt"), "prompt")
+            .await
+            .expect("write prompt");
+        fs::write(
+            old.path().join("registry.json"),
+            r#"{"users":{"u1":{"authorized_at":"2026-01-01T00:00:00Z","mention_only":false}},"channels":{"c1":{"authorized_at":"2026-01-01T00:00:00Z","mention_only":true}}}"#,
+        )
+        .await
+        .expect("write registry");
+
+        migrate_auth_and_sessions(old.path(), newd.path())
+            .await
+            .expect("migrate auth");
+
+        let auth = fs::read_to_string(newd.path().join("auth.json"))
+            .await
+            .expect("read auth");
+        assert!(auth.contains("\"users\""));
+        assert!(auth.contains("\"channels\""));
+        assert!(auth.contains("\"agent_type\": \"pi\""));
+        assert!(newd
+            .path()
+            .join("sessions")
+            .join("pi")
+            .join("s1.jsonl")
+            .exists());
+        assert!(newd.path().join("prompts").join("p1.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v0_to_v1_creates_expected_layout() {
+        let old = tempdir().expect("old");
+        let newd = tempdir().expect("new");
+        fs::create_dir_all(old.path()).await.expect("mkdir old");
+
+        migrate_v0_to_v1(old.path(), newd.path())
+            .await
+            .expect("migrate");
+
+        assert!(newd.path().join("sessions").join("pi").exists());
+        assert!(newd.path().join("sessions").join("opencode").exists());
+        assert!(newd.path().join("sessions").join("copilot").exists());
+        assert!(newd.path().join("prompts").exists());
+        assert!(newd.path().join("uploads").exists());
+
+        let cfg = fs::read_to_string(newd.path().join("config.toml"))
+            .await
+            .expect("read cfg");
+        assert!(cfg.contains("assistant_name = \"Agent\""));
+    }
 }

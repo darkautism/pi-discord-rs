@@ -10,6 +10,15 @@ use crate::agent::AgentType;
 
 const ASSISTANT_NAME_MAX_CHARS: usize = 48;
 
+#[derive(Debug, Clone, PartialEq)]
+enum ConfigSelectAction {
+    Backend(AgentType),
+    Mention(bool),
+    AssistantDefault,
+    AssistantCustom,
+    Ignore,
+}
+
 pub struct ConfigCommand;
 
 #[async_trait]
@@ -147,18 +156,35 @@ fn sanitize_assistant_name(raw: &str) -> Option<String> {
     Some(final_name)
 }
 
+fn extract_selected_value(kind: &serenity::all::ComponentInteractionDataKind) -> Option<String> {
+    match kind {
+        serenity::all::ComponentInteractionDataKind::StringSelect { values } => {
+            values.first().cloned()
+        }
+        _ => None,
+    }
+}
+
+fn parse_config_select_action(custom_id: &str, value: &str) -> ConfigSelectAction {
+    match custom_id {
+        "config_backend_select" => value
+            .parse::<AgentType>()
+            .map(ConfigSelectAction::Backend)
+            .unwrap_or(ConfigSelectAction::Ignore),
+        "config_mention_select" => ConfigSelectAction::Mention(value == "on"),
+        "config_assistant_select" if value == "default" => ConfigSelectAction::AssistantDefault,
+        "config_assistant_select" if value == "custom" => ConfigSelectAction::AssistantCustom,
+        _ => ConfigSelectAction::Ignore,
+    }
+}
+
 pub async fn handle_config_select(
     ctx: &Context,
     interaction: &serenity::all::ComponentInteraction,
     state: &crate::AppState,
 ) -> anyhow::Result<()> {
     let custom_id = interaction.data.custom_id.as_str();
-    let value = match &interaction.data.kind {
-        serenity::all::ComponentInteractionDataKind::StringSelect { values } => {
-            values.first().cloned()
-        }
-        _ => None,
-    };
+    let value = extract_selected_value(&interaction.data.kind);
     let Some(value) = value else {
         return Ok(());
     };
@@ -166,7 +192,7 @@ pub async fn handle_config_select(
     let channel_id_u64 = interaction.channel_id.get();
     let channel_id_str = interaction.channel_id.to_string();
 
-    if custom_id == "config_assistant_select" && value == "custom" {
+    if parse_config_select_action(custom_id, &value) == ConfigSelectAction::AssistantCustom {
         let channel_config = crate::commands::agent::ChannelConfig::load()
             .await
             .unwrap_or_default();
@@ -201,9 +227,8 @@ pub async fn handle_config_select(
 
     interaction.defer_ephemeral(&ctx.http).await?;
 
-    match custom_id {
-        "config_backend_select" => {
-            let selected: AgentType = value.parse()?;
+    match parse_config_select_action(custom_id, &value) {
+        ConfigSelectAction::Backend(selected) => {
             let mut channel_config = crate::commands::agent::ChannelConfig::load()
                 .await
                 .unwrap_or_default();
@@ -242,8 +267,7 @@ pub async fn handle_config_select(
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(msg))
                 .await?;
         }
-        "config_mention_select" => {
-            let enable = value == "on";
+        ConfigSelectAction::Mention(enable) => {
             let msg = {
                 let i18n = state.i18n.read().await;
                 match state.auth.set_mention_only(&channel_id_str, enable) {
@@ -256,7 +280,7 @@ pub async fn handle_config_select(
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(msg))
                 .await?;
         }
-        "config_assistant_select" => {
+        ConfigSelectAction::AssistantDefault => {
             let mut channel_config = crate::commands::agent::ChannelConfig::load()
                 .await
                 .unwrap_or_default();
@@ -278,7 +302,7 @@ pub async fn handle_config_select(
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(msg))
                 .await?;
         }
-        _ => {}
+        ConfigSelectAction::AssistantCustom | ConfigSelectAction::Ignore => {}
     }
 
     Ok(())
@@ -337,7 +361,12 @@ pub async fn handle_assistant_modal_submit(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_assistant_name;
+    use super::{
+        extract_selected_value, parse_config_select_action, sanitize_assistant_name,
+        ConfigSelectAction,
+    };
+    use serenity::all::ComponentInteractionDataKind;
+    use crate::agent::AgentType;
 
     #[test]
     fn test_sanitize_assistant_name_strips_controls_and_limits_length() {
@@ -358,5 +387,48 @@ mod tests {
         let input = "測試助手名稱-中文";
         let got = sanitize_assistant_name(input).unwrap_or_default();
         assert_eq!(got, input);
+    }
+
+    #[test]
+    fn test_extract_selected_value_from_string_select() {
+        let kind = ComponentInteractionDataKind::StringSelect {
+            values: vec!["opencode".to_string()],
+        };
+        assert_eq!(
+            extract_selected_value(&kind).as_deref(),
+            Some("opencode")
+        );
+    }
+
+    #[test]
+    fn test_parse_config_select_action_variants() {
+        assert_eq!(
+            parse_config_select_action("config_backend_select", "pi"),
+            ConfigSelectAction::Backend(AgentType::Pi)
+        );
+        assert_eq!(
+            parse_config_select_action("config_mention_select", "on"),
+            ConfigSelectAction::Mention(true)
+        );
+        assert_eq!(
+            parse_config_select_action("config_assistant_select", "default"),
+            ConfigSelectAction::AssistantDefault
+        );
+        assert_eq!(
+            parse_config_select_action("config_assistant_select", "custom"),
+            ConfigSelectAction::AssistantCustom
+        );
+        assert_eq!(
+            parse_config_select_action("unknown", "x"),
+            ConfigSelectAction::Ignore
+        );
+        assert_eq!(
+            parse_config_select_action("config_mention_select", "off"),
+            ConfigSelectAction::Mention(false)
+        );
+        assert_eq!(
+            parse_config_select_action("config_backend_select", "invalid-backend"),
+            ConfigSelectAction::Ignore
+        );
     }
 }

@@ -1,4 +1,4 @@
-use agent::{AgentEvent, AiAgent, ContentType, UserInput};
+use agent::{AiAgent, UserInput};
 use clap::{Parser, Subcommand};
 use rust_embed::RustEmbed;
 use serenity::all::{
@@ -21,18 +21,26 @@ mod auth;
 mod commands;
 mod composer;
 mod config;
+mod flow;
 mod migrate;
 mod session;
 mod uploads;
+mod writer_logic;
 
 use auth::AuthManager;
 use commands::agent::{handle_button, ChannelConfig};
-use composer::{Block, BlockType, EmbedComposer};
+use composer::EmbedComposer;
 use config::Config;
 use cron::CronManager;
+use flow::{
+    build_render_view, build_systemd_service_content, detect_timezone, get_systemd_service_path,
+    resolve_channel_assistant_name, route_component, route_modal, should_process_message,
+    ComponentRoute, ModalRoute,
+};
 use i18n::I18n;
 use session::SessionManager;
 use uploads::UploadManager;
+use writer_logic::apply_agent_event;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -173,12 +181,11 @@ impl Handler {
         let status: Arc<Mutex<ExecStatus>> = Arc::new(Mutex::new(ExecStatus::Running));
         let assistant_name = {
             let channel_cfg = ChannelConfig::load().await.unwrap_or_default();
-            channel_cfg
-                .channels
-                .get(&channel_id.to_string())
-                .and_then(|e| e.assistant_name.clone())
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| state.config.assistant_name.clone())
+            resolve_channel_assistant_name(
+                &channel_cfg,
+                &channel_id.to_string(),
+                &state.config.assistant_name,
+            )
         };
 
         // --- 任務啟動：收集所有 Handles ---
@@ -250,46 +257,10 @@ impl Handler {
                 };
 
                 if desc != last_content || current_status != last_status {
-                    let mut embed = CreateEmbed::new();
                     let i18n = render_i18n.read().await;
-
-                    match &current_status {
-                        ExecStatus::Error(e) => {
-                            embed = embed
-                                .title(i18n.get("api_error"))
-                                .color(0xff0000)
-                                .description(format!(
-                                    "{}\n\n{} {}",
-                                    desc,
-                                    i18n.get("runtime_error_prefix"),
-                                    e
-                                ));
-                        }
-                        ExecStatus::Success => {
-                            let title = i18n
-                                .get_args("agent_response", &[render_assistant_name.clone()]);
-                            embed = embed
-                                .title(title)
-                                .color(0x00ff00)
-                                .description(if desc.is_empty() {
-                                    i18n.get("done")
-                                } else {
-                                    desc.clone()
-                                });
-                        }
-                        ExecStatus::Running => {
-                            let title = i18n
-                                .get_args("agent_working", &[render_assistant_name.clone()]);
-                            embed = embed
-                                .title(title)
-                                .color(0xFFA500)
-                                .description(if desc.is_empty() {
-                                    i18n.get("wait")
-                                } else {
-                                    desc.clone()
-                                });
-                        }
-                    }
+                    let (title, color, body) =
+                        build_render_view(&i18n, &current_status, &desc, &render_assistant_name);
+                    let embed = CreateEmbed::new().title(title).color(color).description(body);
 
                     if let Err(e) = render_msg
                         .edit(&render_http, EditMessage::new().embed(embed))
@@ -335,79 +306,7 @@ impl Handler {
                     Ok(event) => {
                         let mut comp = writer_composer.lock().await;
                         let mut s = writer_status.lock().await;
-
-                        match event {
-                            AgentEvent::MessageUpdate {
-                                thinking: t,
-                                text: txt,
-                                is_delta,
-                                id,
-                            } => {
-                                if is_delta {
-                                    if !t.is_empty() {
-                                        comp.push_delta(id.clone(), BlockType::Thinking, &t);
-                                    }
-                                    if !txt.is_empty() {
-                                        comp.push_delta(id, BlockType::Text, &txt);
-                                    }
-                                } else {
-                                    if !t.is_empty() {
-                                        comp.update_block_by_id(
-                                            &id.clone().unwrap_or_else(|| "think".into()),
-                                            BlockType::Thinking,
-                                            t,
-                                        );
-                                    }
-                                    if !txt.is_empty() {
-                                        comp.update_block_by_id(
-                                            &id.unwrap_or_else(|| "text".into()),
-                                            BlockType::Text,
-                                            txt,
-                                        );
-                                    }
-                                }
-                            }
-                            AgentEvent::ContentSync { items } => {
-                                let mapped = items
-                                    .into_iter()
-                                    .map(|i| match i.type_ {
-                                        ContentType::Thinking => {
-                                            Block::new(BlockType::Thinking, i.content)
-                                        }
-                                        ContentType::Text => Block::new(BlockType::Text, i.content),
-                                        ContentType::ToolCall(n) => {
-                                            Block::with_label(BlockType::ToolCall, n, i.id)
-                                        }
-                                        ContentType::ToolOutput => {
-                                            let mut b =
-                                                Block::new(BlockType::ToolOutput, i.content);
-                                            b.id = i.id;
-                                            b
-                                        }
-                                    })
-                                    .collect();
-                                comp.sync_content(mapped);
-                            }
-                            AgentEvent::ToolExecutionStart { id, name } => {
-                                comp.set_tool_call(id, name);
-                            }
-                            AgentEvent::ToolExecutionUpdate { id, output } => {
-                                comp.update_block_by_id(&id, BlockType::ToolOutput, output);
-                            }
-                            AgentEvent::AgentEnd { success, error } => {
-                                *s = if success {
-                                    ExecStatus::Success
-                                } else {
-                                    ExecStatus::Error(error.unwrap_or_else(|| "Error".to_string()))
-                                };
-                            }
-                            AgentEvent::Error { message } => {
-                                *s = ExecStatus::Error(message);
-                            }
-                            _ => {}
-                        }
-
-                        let finished = *s != ExecStatus::Running;
+                        let finished = apply_agent_event(&mut comp, &mut s, event);
                         drop(comp);
                         drop(s);
                         if finished {
@@ -480,14 +379,8 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
-            return;
-        }
-
-        // 1. 過濾討論串建立等系統訊息 (僅處理 Regular 訊息)
-        if msg.kind != serenity::all::MessageType::Regular
-            && msg.kind != serenity::all::MessageType::InlineReply
-        {
+        let mentioned = msg.mentions_me(&ctx).await.unwrap_or(false);
+        if !should_process_message(msg.author.bot, msg.kind, false, mentioned) {
             return;
         }
 
@@ -503,7 +396,7 @@ impl EventHandler for Handler {
         let channel_id_str = msg.channel_id.to_string();
 
         if !is_auth {
-            if msg.mentions_me(&ctx).await.unwrap_or(false) {
+            if mentioned {
                 if let Ok(token) = self.state.auth.create_token("channel", &channel_id_str) {
                     let auth_msg = {
                         let i18n = self.state.i18n.read().await;
@@ -517,7 +410,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        if mention_only && !msg.mentions_me(&ctx).await.unwrap_or(false) {
+        if !should_process_message(false, msg.kind, mention_only, mentioned) {
             return;
         }
 
@@ -613,50 +506,60 @@ impl EventHandler for Handler {
             });
         } else if let Interaction::Modal(modal) = interaction {
             let custom_id = modal.data.custom_id.as_str();
-            if custom_id == "cron_setup" {
-                let state = self.state.clone();
-                tokio::spawn(async move {
-                    let _ = commands::cron::handle_modal_submit(&ctx, &modal, &state).await;
-                });
-            } else if custom_id == "config_assistant_modal" {
-                let state = self.state.clone();
-                tokio::spawn(async move {
-                    let _ = commands::config::handle_assistant_modal_submit(&ctx, &modal, &state)
-                        .await;
-                });
+            match route_modal(custom_id) {
+                ModalRoute::CronSetup => {
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        let _ = commands::cron::handle_modal_submit(&ctx, &modal, &state).await;
+                    });
+                }
+                ModalRoute::ConfigAssistant => {
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        let _ = commands::config::handle_assistant_modal_submit(&ctx, &modal, &state)
+                            .await;
+                    });
+                }
+                ModalRoute::Ignore => {}
             }
         } else if let Interaction::Component(component) = interaction {
             let custom_id = component.data.custom_id.as_str();
-            if custom_id.starts_with("config_") {
-                let _ = commands::config::handle_config_select(&ctx, &component, &self.state).await;
-            } else if custom_id.starts_with("agent_") {
-                let _ = handle_button(&ctx, &component, &self.state).await;
-            } else if custom_id == "cron_delete_select" {
-                let state = self.state.clone();
-                tokio::spawn(async move {
-                    let _ = commands::cron::handle_delete_select(&ctx, &component, &state).await;
-                });
-            } else if custom_id.starts_with("model_select") {
-                let state = self.state.clone();
-                tokio::spawn(async move {
-                    let channel_id_str = component.channel_id.to_string();
-                    let channel_config = ChannelConfig::load().await.unwrap_or_default();
-                    let agent_type = channel_config.get_agent_type(&channel_id_str);
+            match route_component(custom_id) {
+                ComponentRoute::Config => {
+                    let _ = commands::config::handle_config_select(&ctx, &component, &self.state).await;
+                }
+                ComponentRoute::Agent => {
+                    let _ = handle_button(&ctx, &component, &self.state).await;
+                }
+                ComponentRoute::CronDelete => {
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        let _ = commands::cron::handle_delete_select(&ctx, &component, &state).await;
+                    });
+                }
+                ComponentRoute::ModelSelect => {
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        let channel_id_str = component.channel_id.to_string();
+                        let channel_config = ChannelConfig::load().await.unwrap_or_default();
+                        let agent_type = channel_config.get_agent_type(&channel_id_str);
 
-                    if let Ok((agent, _)) = state
-                        .session_manager
-                        .get_or_create_session(
-                            component.channel_id.get(),
-                            agent_type,
-                            &state.backend_manager,
-                        )
-                        .await
-                    {
-                        let _ =
-                            commands::model::handle_model_select(&ctx, &component, agent, &state)
-                                .await;
-                    }
-                });
+                        if let Ok((agent, _)) = state
+                            .session_manager
+                            .get_or_create_session(
+                                component.channel_id.get(),
+                                agent_type,
+                                &state.backend_manager,
+                            )
+                            .await
+                        {
+                            let _ =
+                                commands::model::handle_model_select(&ctx, &component, agent, &state)
+                                    .await;
+                        }
+                    });
+                }
+                ComponentRoute::Ignore => {}
             }
         }
     }
@@ -705,6 +608,53 @@ async fn run_bot() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::load_all_prompts;
+    use crate::migrate::{get_prompts_dir, BASE_DIR_ENV};
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_load_all_prompts_creates_defaults_when_empty() {
+        let _guard = env_lock().lock().expect("lock");
+        let dir = tempdir().expect("tempdir");
+        // SAFETY: serialized by env lock
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+
+        let out = load_all_prompts();
+        assert!(!out.trim().is_empty());
+        assert!(dir.path().join("prompts").exists());
+
+        // SAFETY: serialized by env lock
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+    }
+
+    #[test]
+    fn test_load_all_prompts_reads_existing_files_sorted() {
+        let _guard = env_lock().lock().expect("lock");
+        let dir = tempdir().expect("tempdir");
+        // SAFETY: serialized by env lock
+        unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
+
+        let prompts_dir = get_prompts_dir();
+        std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        std::fs::write(prompts_dir.join("b.md"), "B").expect("write b");
+        std::fs::write(prompts_dir.join("a.md"), "A").expect("write a");
+
+        let out = load_all_prompts();
+        assert_eq!(out, "A\n\nB");
+
+        // SAFETY: serialized by env lock
+        unsafe { std::env::remove_var(BASE_DIR_ENV) };
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
@@ -713,12 +663,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Run) => run_bot().await?,
         Some(Commands::Version) => println!("v{}", env!("CARGO_PKG_VERSION")),
         Some(Commands::Daemon { action }) => {
-            let service_path = dirs::config_dir()
-                .or_else(dirs::home_dir)
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine config/home directory"))?
-                .join("systemd")
-                .join("user")
-                .join("agent-discord-rs.service");
+            let service_path = get_systemd_service_path()?;
 
             match action {
                 DaemonAction::Enable => {
@@ -726,34 +671,14 @@ async fn main() -> anyhow::Result<()> {
                     let exe_path = std::env::current_exe()?.to_string_lossy().to_string();
 
                     // 2. 偵測時區
-                    let tz = std::fs::read_to_string("/etc/timezone")
-                        .unwrap_or_else(|_| "UTC".to_string())
-                        .trim()
-                        .to_string();
+                    let tz = detect_timezone();
 
                     // 3. 取得目前環境變數
                     let current_path = std::env::var("PATH").unwrap_or_default();
-                    let augmented_path =
-                        agent::manager::BackendManager::build_augmented_path(&current_path);
+                    let augmented_path = agent::runtime::build_augmented_path(&current_path);
 
-                    let service_content = format!(
-                        r#"[Unit]
-Description=Agent Discord RS
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={} run
-Environment="PATH={}"
-Environment="TZ={}"
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=default.target
-"#,
-                        exe_path, augmented_path, tz
-                    );
+                    let service_content =
+                        build_systemd_service_content(&exe_path, &augmented_path, &tz);
 
                     std::fs::create_dir_all(service_path.parent().unwrap())?;
                     std::fs::write(&service_path, service_content)?;

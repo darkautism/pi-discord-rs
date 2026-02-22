@@ -107,20 +107,15 @@ impl SessionManager {
         Ok((session, is_brand_new))
     }
 
-    async fn persist_sid(
-        &self,
-        channel_id: u64,
+    fn apply_sid(
+        channel_config: &mut crate::commands::agent::ChannelConfig,
+        channel_id: &str,
         agent_type: AgentType,
         sid: String,
-    ) -> anyhow::Result<()> {
-        let channel_id_str = channel_id.to_string();
-        let mut channel_config = crate::commands::agent::ChannelConfig::load()
-            .await
-            .unwrap_or_default();
-
+    ) {
         let entry = channel_config
             .channels
-            .entry(channel_id_str)
+            .entry(channel_id.to_string())
             .or_insert_with(|| crate::commands::agent::ChannelEntry {
                 agent_type: agent_type.clone(),
                 authorized_at: chrono::Utc::now().to_rfc3339(),
@@ -132,6 +127,20 @@ impl SessionManager {
             });
 
         entry.session_id = Some(sid);
+    }
+
+    async fn persist_sid(
+        &self,
+        channel_id: u64,
+        agent_type: AgentType,
+        sid: String,
+    ) -> anyhow::Result<()> {
+        let channel_id_str = channel_id.to_string();
+        let mut channel_config = crate::commands::agent::ChannelConfig::load()
+            .await
+            .unwrap_or_default();
+
+        Self::apply_sid(&mut channel_config, &channel_id_str, agent_type, sid);
         channel_config.save().await?;
         Ok(())
     }
@@ -164,5 +173,40 @@ mod tests {
 
         let sessions = manager.sessions.read().await;
         assert!(!sessions.contains_key(&channel_id));
+    }
+
+    #[test]
+    fn test_apply_sid_creates_channel_entry_when_missing() {
+        let mut cfg = crate::commands::agent::ChannelConfig::default();
+        SessionManager::apply_sid(&mut cfg, "1001", AgentType::Copilot, "sid-1".to_string());
+        let entry = cfg.channels.get("1001").expect("entry exists");
+        assert_eq!(entry.agent_type, AgentType::Copilot);
+        assert_eq!(entry.session_id.as_deref(), Some("sid-1"));
+        assert!(entry.mention_only);
+        assert!(!entry.authorized_at.is_empty());
+    }
+
+    #[test]
+    fn test_apply_sid_overwrites_existing_sid_only() {
+        let mut cfg = crate::commands::agent::ChannelConfig::default();
+        cfg.channels.insert(
+            "1002".to_string(),
+            crate::commands::agent::ChannelEntry {
+                agent_type: AgentType::Pi,
+                authorized_at: "2026-01-01T00:00:00Z".to_string(),
+                mention_only: false,
+                session_id: Some("old".to_string()),
+                model_provider: Some("p".to_string()),
+                model_id: Some("m".to_string()),
+                assistant_name: Some("a".to_string()),
+            },
+        );
+        SessionManager::apply_sid(&mut cfg, "1002", AgentType::Kilo, "new-sid".to_string());
+        let entry = cfg.channels.get("1002").expect("entry exists");
+        assert_eq!(entry.session_id.as_deref(), Some("new-sid"));
+        assert_eq!(entry.agent_type, AgentType::Pi);
+        assert_eq!(entry.model_provider.as_deref(), Some("p"));
+        assert_eq!(entry.model_id.as_deref(), Some("m"));
+        assert_eq!(entry.assistant_name.as_deref(), Some("a"));
     }
 }

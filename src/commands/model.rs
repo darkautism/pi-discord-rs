@@ -10,6 +10,20 @@ use crate::agent::AiAgent;
 use tracing::{error, info};
 
 pub struct ModelCommand;
+const MAX_SELECT_OPTIONS: usize = 125;
+const SELECT_CHUNK_SIZE: usize = 25;
+
+fn capped_model_count(models_len: usize) -> usize {
+    models_len.min(MAX_SELECT_OPTIONS)
+}
+
+fn build_model_value(provider: &str, model_id: &str) -> String {
+    format!("{}|{}", provider, model_id)
+}
+
+fn parse_model_value(composite: &str) -> Option<(&str, &str)> {
+    composite.split_once('|')
+}
 
 #[async_trait]
 impl SlashCommand for ModelCommand {
@@ -81,15 +95,15 @@ impl SlashCommand for ModelCommand {
         let mut action_rows = Vec::new();
 
         // 限制最多 125 個模型 (5 rows * 25 options)
-        let total_models = models.len().min(125);
+        let total_models = capped_model_count(models.len());
         let models_slice = &models[..total_models];
 
-        for (idx, chunk) in models_slice.chunks(25).enumerate() {
+        for (idx, chunk) in models_slice.chunks(SELECT_CHUNK_SIZE).enumerate() {
             let select_options: Vec<CreateSelectMenuOption> = chunk
                 .iter()
                 .map(|m| {
                     // 使用 | 作為定界符，避免與 ID 內部的 / 衝突
-                    let value = format!("{}|{}", m.provider, m.id);
+                    let value = build_model_value(&m.provider, &m.id);
                     CreateSelectMenuOption::new(&m.label, value)
                         .description(i18n.get_args("model_provider_desc", &[m.provider.clone()]))
                 })
@@ -143,7 +157,7 @@ pub async fn handle_model_select(
     {
         if let Some(composite_id) = values.first() {
             // 使用 | 分解
-            if let Some((provider, model)) = composite_id.split_once('|') {
+            if let Some((provider, model)) = parse_model_value(composite_id) {
                 match agent.set_model(provider, model).await {
                     Ok(_) => {
                         interaction
@@ -184,4 +198,30 @@ pub async fn handle_model_select(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_model_value, capped_model_count, parse_model_value};
+
+    #[test]
+    fn test_capped_model_count_limited_to_125() {
+        assert_eq!(capped_model_count(0), 0);
+        assert_eq!(capped_model_count(24), 24);
+        assert_eq!(capped_model_count(125), 125);
+        assert_eq!(capped_model_count(200), 125);
+    }
+
+    #[test]
+    fn test_build_and_parse_model_value_roundtrip() {
+        let composite = build_model_value("openai", "gpt-4.1");
+        let (provider, model) = parse_model_value(&composite).expect("must parse");
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-4.1");
+    }
+
+    #[test]
+    fn test_parse_model_value_rejects_invalid() {
+        assert!(parse_model_value("no-delimiter").is_none());
+    }
 }

@@ -1,8 +1,7 @@
 use super::{AgentEvent, AgentState, AiAgent, ContentItem, ContentType, ModelInfo};
-use crate::agent::manager::BackendManager;
+use crate::agent::runtime;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct PiAgent {
     stdin: Arc<Mutex<ChildStdin>>,
@@ -22,10 +21,9 @@ pub struct PiAgent {
 impl PiAgent {
     pub async fn new(channel_id: u64, session_dir: &PathBuf) -> anyhow::Result<(Arc<Self>, u64)> {
         std::fs::create_dir_all(session_dir)?;
-        let pi_binary = std::env::var("PI_BINARY")
-            .ok()
-            .filter(|v| BackendManager::is_candidate_runnable(Path::new(v)))
-            .unwrap_or_else(|| BackendManager::resolve_binary_path("pi"));
+        let pi_binary = runtime::resolve_binary_with_env("PI_BINARY", "pi");
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let augmented_path = runtime::build_augmented_path(&current_path);
 
         info!("🚀 Spawning Pi binary: {}", pi_binary);
         let session_file = session_dir.join(format!("discord-rs-{}.jsonl", channel_id));
@@ -36,6 +34,7 @@ impl PiAgent {
             .arg(&session_file)
             .arg("--session-dir")
             .arg(session_dir)
+            .env("PATH", augmented_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -59,6 +58,22 @@ impl PiAgent {
                 }
                 if let Ok(val) = serde_json::from_str::<Value>(line.trim()) {
                     Self::parse_event(&tx_stdout, val, &trace_stdout).await;
+                }
+                line.clear();
+            }
+        });
+
+        let stderr = child.stderr.take().unwrap();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                let msg = line.trim();
+                if !msg.is_empty() {
+                    warn!("pi(stderr): {}", msg);
                 }
                 line.clear();
             }
@@ -611,6 +626,131 @@ mod tests {
             assert_eq!(id, "id-99");
         } else {
             panic!("Wrong event");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_partial_trace_merges_into_tool_call() {
+        let (tx, mut rx, pending) = setup_parser_test();
+        let val = json!({
+            "type": "message_update",
+            "partial": {
+                "content": [
+                    { "type": "text", "text": "→ run tool" },
+                    { "type": "toolCall", "toolCall": { "id": "t1", "name": "bash" } }
+                ]
+            }
+        });
+        PiAgent::parse_event(&tx, val, &pending).await;
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            AgentEvent::ContentSync { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id.as_deref(), Some("t1"));
+                assert!(matches!(items[0].type_, ContentType::ToolCall(_)));
+            }
+            _ => panic!("expected content sync"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_tool_execution_update_and_end() {
+        let (tx, mut rx, pending) = setup_parser_test();
+        let update = json!({
+            "type":"tool_execution_update",
+            "toolCallId":"tid",
+            "partialResult":{"content":[{"text":"line1"},{"text":"line2"}]}
+        });
+        PiAgent::parse_event(&tx, update, &pending).await;
+        match rx.recv().await.unwrap() {
+            AgentEvent::ToolExecutionUpdate { id, output } => {
+                assert_eq!(id, "tid");
+                assert_eq!(output, "line1");
+            }
+            _ => panic!("expected tool update"),
+        }
+        match rx.recv().await.unwrap() {
+            AgentEvent::ToolExecutionUpdate { id, output } => {
+                assert_eq!(id, "tid");
+                assert_eq!(output, "line2");
+            }
+            _ => panic!("expected tool update"),
+        }
+
+        let end = json!({
+            "type":"tool_execution_end",
+            "toolCallId":"tid",
+            "toolName":"bash",
+            "result":{"content":[{"text":"done"}]}
+        });
+        PiAgent::parse_event(&tx, end, &pending).await;
+        match rx.recv().await.unwrap() {
+            AgentEvent::ToolExecutionUpdate { id, output } => {
+                assert_eq!(id, "tid");
+                assert_eq!(output, "done");
+            }
+            _ => panic!("expected tool update"),
+        }
+        match rx.recv().await.unwrap() {
+            AgentEvent::ToolExecutionEnd { id, name } => {
+                assert_eq!(id, "tid");
+                assert_eq!(name, "bash");
+            }
+            _ => panic!("expected tool end"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_response_and_error() {
+        let (tx, mut rx, pending) = setup_parser_test();
+        let response = json!({"type":"response","id":"cmd-1","data":{"ok":true}});
+        PiAgent::parse_event(&tx, response, &pending).await;
+        match rx.recv().await.unwrap() {
+            AgentEvent::CommandResponse { id, data } => {
+                assert_eq!(id, "cmd-1");
+                assert_eq!(data["ok"], true);
+            }
+            _ => panic!("expected response"),
+        }
+
+        let err = json!({"type":"error","error":"boom"});
+        PiAgent::parse_event(&tx, err, &pending).await;
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error { message } => assert_eq!(message, "boom"),
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_agent_end_extracts_current_turn_items_and_error() {
+        let (tx, mut rx, pending) = setup_parser_test();
+        let val = json!({
+            "type":"agent_end",
+            "messages":[
+                {"role":"assistant","content":[{"type":"text","text":"old"}]},
+                {"role":"user","content":[{"type":"text","text":"question"}]},
+                {"role":"tool","content":[{"type":"text","text":"tool output"}]},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"answer"}], "errorMessage":"rate limited"}
+            ]
+        });
+        PiAgent::parse_event(&tx, val, &pending).await;
+
+        let sync = rx.recv().await.unwrap();
+        match sync {
+            AgentEvent::ContentSync { items } => {
+                assert!(items.iter().any(|i| i.content == "tool output"));
+                assert!(items.iter().any(|i| i.content == "plan"));
+                assert!(items.iter().any(|i| i.content == "answer"));
+            }
+            _ => panic!("expected content sync"),
+        }
+
+        match rx.recv().await.unwrap() {
+            AgentEvent::AgentEnd { success, error } => {
+                assert!(!success);
+                assert_eq!(error.as_deref(), Some("rate limited"));
+            }
+            _ => panic!("expected agent end"),
         }
     }
 }

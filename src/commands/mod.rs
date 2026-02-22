@@ -55,3 +55,21 @@ pub fn get_all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(cron::CronListCommand),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_commands_have_name_desc_and_buildable_options() {
+        let i18n = crate::i18n::I18n::new("en");
+        for cmd in get_all_commands() {
+            let name = cmd.name();
+            assert!(!name.trim().is_empty());
+            let desc = cmd.description(&i18n);
+            assert!(!desc.trim().is_empty());
+            let _opts = cmd.options(&i18n);
+            let _create = cmd.create_command(&i18n);
+        }
+    }
+}

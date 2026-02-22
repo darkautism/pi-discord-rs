@@ -1,9 +1,8 @@
 use super::{AgentEvent, AgentState, AiAgent, ModelInfo};
-use crate::agent::manager::BackendManager;
+use crate::agent::runtime;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,6 +24,25 @@ struct SessionInfoCache {
 struct SessionBootstrap {
     session_id: String,
     info: SessionInfoCache,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SessionUpdateAction {
+    MessageUpdate {
+        thinking: String,
+        text: String,
+        is_delta: bool,
+        id: Option<String>,
+    },
+    ToolStart {
+        id: String,
+        name: String,
+    },
+    ToolUpdate {
+        id: String,
+        output: String,
+    },
+    Ignore,
 }
 
 struct CopilotRuntime {
@@ -51,17 +69,14 @@ impl CopilotRuntime {
     }
 
     async fn spawn() -> anyhow::Result<Arc<Self>> {
-        let copilot_bin = std::env::var("COPILOT_BINARY")
-            .ok()
-            .filter(|v| BackendManager::is_candidate_runnable(Path::new(v)))
-            .unwrap_or_else(|| BackendManager::resolve_binary_path("copilot"));
+        let copilot_bin = runtime::resolve_binary_with_env("COPILOT_BINARY", "copilot");
         let current_path = std::env::var("PATH").unwrap_or_default();
         let mut cmd = Command::new(&copilot_bin);
         cmd.arg("--acp")
             .arg("--allow-all-tools")
             .arg("--allow-all-paths")
             .arg("--allow-all-urls")
-            .env("PATH", BackendManager::build_augmented_path(&current_path))
+            .env("PATH", runtime::build_augmented_path(&current_path))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -169,7 +184,22 @@ impl CopilotRuntime {
             None => return,
         };
 
-        let option_id = msg["params"]["options"].as_array().and_then(|options| {
+        let option_id = Self::permission_option_id(msg);
+
+        if let Some(option_id) = option_id {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "optionId": option_id }
+            });
+            if let Err(e) = self.send_raw(&response).await {
+                warn!("Failed to auto-respond permission request: {}", e);
+            }
+        }
+    }
+
+    fn permission_option_id(msg: &Value) -> Option<String> {
+        msg["params"]["options"].as_array().and_then(|options| {
             options
                 .iter()
                 .find_map(|opt| {
@@ -185,18 +215,7 @@ impl CopilotRuntime {
                         .iter()
                         .find_map(|opt| opt.get("optionId")?.as_str().map(|s| s.to_string()))
                 })
-        });
-
-        if let Some(option_id) = option_id {
-            let response = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "optionId": option_id }
-            });
-            if let Err(e) = self.send_raw(&response).await {
-                warn!("Failed to auto-respond permission request: {}", e);
-            }
-        }
+        })
     }
 
     async fn handle_session_update(&self, msg: &Value) {
@@ -214,27 +233,55 @@ impl CopilotRuntime {
         };
 
         let update = &msg["params"]["update"];
-        let update_type = update["sessionUpdate"].as_str().unwrap_or("");
+        match Self::parse_session_update(update) {
+            SessionUpdateAction::MessageUpdate {
+                thinking,
+                text,
+                is_delta,
+                id,
+            } => {
+                let _ = tx.send(AgentEvent::MessageUpdate {
+                    thinking,
+                    text,
+                    is_delta,
+                    id,
+                });
+            }
+            SessionUpdateAction::ToolStart { id, name } => {
+                let _ = tx.send(AgentEvent::ToolExecutionStart { id, name });
+            }
+            SessionUpdateAction::ToolUpdate { id, output } => {
+                let _ = tx.send(AgentEvent::ToolExecutionUpdate { id, output });
+            }
+            SessionUpdateAction::Ignore => {}
+        }
+    }
 
+    fn parse_session_update(update: &Value) -> SessionUpdateAction {
+        let update_type = update["sessionUpdate"].as_str().unwrap_or("");
         match update_type {
             "agent_thought_chunk" => {
                 if let Some(text) = Self::update_text(update) {
-                    let _ = tx.send(AgentEvent::MessageUpdate {
+                    SessionUpdateAction::MessageUpdate {
                         thinking: text,
                         text: "".to_string(),
                         is_delta: true,
                         id: None,
-                    });
+                    }
+                } else {
+                    SessionUpdateAction::Ignore
                 }
             }
             "agent_message_chunk" => {
                 if let Some(text) = Self::update_text(update) {
-                    let _ = tx.send(AgentEvent::MessageUpdate {
+                    SessionUpdateAction::MessageUpdate {
                         thinking: "".to_string(),
                         text,
                         is_delta: true,
                         id: None,
-                    });
+                    }
+                } else {
+                    SessionUpdateAction::Ignore
                 }
             }
             "tool_call" => {
@@ -244,9 +291,10 @@ impl CopilotRuntime {
                     .as_str()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "Tool Call".to_string());
-
                 if status == "pending" || status == "running" {
-                    let _ = tx.send(AgentEvent::ToolExecutionStart { id, name: title });
+                    SessionUpdateAction::ToolStart { id, name: title }
+                } else {
+                    SessionUpdateAction::Ignore
                 }
             }
             "tool_call_update" => {
@@ -257,11 +305,13 @@ impl CopilotRuntime {
                 } else {
                     status.to_string()
                 };
-                if !output.is_empty() {
-                    let _ = tx.send(AgentEvent::ToolExecutionUpdate { id, output });
+                if output.is_empty() {
+                    SessionUpdateAction::Ignore
+                } else {
+                    SessionUpdateAction::ToolUpdate { id, output }
                 }
             }
-            _ => {}
+            _ => SessionUpdateAction::Ignore,
         }
     }
 
@@ -610,5 +660,188 @@ impl AiAgent for CopilotAgent {
 
     fn agent_type(&self) -> &'static str {
         "copilot"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CopilotRuntime, SessionUpdateAction};
+    use serde_json::json;
+
+    #[test]
+    fn test_update_text_and_value_text_extract_text() {
+        let update = json!({
+            "content": {"text": "abc"}
+        });
+        assert_eq!(CopilotRuntime::update_text(&update), Some("abc".to_string()));
+
+        let v = json!({"text":"hello"});
+        let out = CopilotRuntime::value_text(&v);
+        assert!(out.contains("\"text\""));
+    }
+
+    #[test]
+    fn test_error_text_formats_object_and_string() {
+        let err_obj = json!({"message": "boom"});
+        assert_eq!(CopilotRuntime::error_text(&err_obj), "boom");
+        let err_str = json!("oops");
+        assert_eq!(CopilotRuntime::error_text(&err_str), "Unknown error");
+    }
+
+    #[test]
+    fn test_parse_session_bootstrap_parses_models_and_current_model() {
+        let result = json!({
+            "sessionId": "sid-1",
+            "models": {
+                "availableModels": [
+                    {"modelId":"m1","name":"M1"},
+                    {"modelId":"m2","name":"M2"}
+                ],
+                "currentModelId": "m2"
+            }
+        });
+        let parsed = CopilotRuntime::parse_session_bootstrap(result).expect("parse");
+        assert_eq!(parsed.session_id, "sid-1");
+        assert_eq!(parsed.info.models.len(), 2);
+        assert_eq!(parsed.info.current_model.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn test_permission_option_id_prefers_allow_always() {
+        let msg = json!({
+            "params": {
+                "options": [
+                    {"optionId":"allow_once"},
+                    {"optionId":"allow_always_workspace"}
+                ]
+            }
+        });
+        assert_eq!(
+            CopilotRuntime::permission_option_id(&msg).as_deref(),
+            Some("allow_always_workspace")
+        );
+    }
+
+    #[test]
+    fn test_parse_session_update_variants() {
+        let thought = json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"hmm"}});
+        assert_eq!(
+            CopilotRuntime::parse_session_update(&thought),
+            SessionUpdateAction::MessageUpdate {
+                thinking: "hmm".to_string(),
+                text: "".to_string(),
+                is_delta: true,
+                id: None
+            }
+        );
+
+        let tool = json!({"sessionUpdate":"tool_call","toolCallId":"t1","status":"running","title":"Shell"});
+        assert_eq!(
+            CopilotRuntime::parse_session_update(&tool),
+            SessionUpdateAction::ToolStart {
+                id: "t1".to_string(),
+                name: "Shell".to_string()
+            }
+        );
+
+        let update = json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"done","rawOutput":{"ok":true}});
+        let parsed = CopilotRuntime::parse_session_update(&update);
+        match parsed {
+            SessionUpdateAction::ToolUpdate { id, output } => {
+                assert_eq!(id, "t1");
+                assert!(output.contains("\"ok\""));
+            }
+            _ => panic!("expected tool update"),
+        }
+    }
+
+    #[test]
+    fn test_permission_option_id_fallback_and_none() {
+        let msg = json!({
+            "params": {
+                "options": [
+                    {"optionId":"allow_once"}
+                ]
+            }
+        });
+        assert_eq!(
+            CopilotRuntime::permission_option_id(&msg).as_deref(),
+            Some("allow_once")
+        );
+
+        let empty = json!({"params":{"options":[]}});
+        assert!(CopilotRuntime::permission_option_id(&empty).is_none());
+    }
+
+    #[test]
+    fn test_parse_session_update_ignore_paths() {
+        let non_running = json!({"sessionUpdate":"tool_call","toolCallId":"t1","status":"done"});
+        assert_eq!(
+            CopilotRuntime::parse_session_update(&non_running),
+            SessionUpdateAction::Ignore
+        );
+
+        let empty_update = json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"","rawOutput":null});
+        assert_eq!(
+            CopilotRuntime::parse_session_update(&empty_update),
+            SessionUpdateAction::Ignore
+        );
+
+        let unknown = json!({"sessionUpdate":"other"});
+        assert_eq!(
+            CopilotRuntime::parse_session_update(&unknown),
+            SessionUpdateAction::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_session_update_message_chunk() {
+        let msg = json!({"sessionUpdate":"agent_message_chunk","text":"hello"});
+        assert_eq!(
+            CopilotRuntime::parse_session_update(&msg),
+            SessionUpdateAction::MessageUpdate {
+                thinking: "".to_string(),
+                text: "hello".to_string(),
+                is_delta: true,
+                id: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_session_bootstrap_missing_session_id_fails() {
+        let result = json!({
+            "models": {
+                "availableModels": [],
+                "currentModelId": null
+            }
+        });
+        let err = CopilotRuntime::parse_session_bootstrap(result).expect_err("should fail");
+        assert!(err.to_string().contains("Missing sessionId"));
+    }
+
+    #[test]
+    fn test_value_text_string_passthrough_and_tool_update_status_fallback() {
+        assert_eq!(CopilotRuntime::value_text(&json!("raw")), "raw");
+
+        let update = json!({
+            "sessionUpdate":"tool_call_update",
+            "toolCallId":"t2",
+            "status":"running",
+            "rawOutput":null
+        });
+        assert_eq!(
+            CopilotRuntime::parse_session_update(&update),
+            SessionUpdateAction::ToolUpdate {
+                id: "t2".to_string(),
+                output: "running".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_permission_option_id_without_options_returns_none() {
+        let msg = json!({"params":{}});
+        assert!(CopilotRuntime::permission_option_id(&msg).is_none());
     }
 }
