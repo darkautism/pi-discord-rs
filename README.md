@@ -1,6 +1,25 @@
-# Agent Discord (Rust)
+<div align="center">
+
+<picture>
+   <img alt="Logo for Agent Discord" src="doc/images/banner.png" width="100%" height="auto">
+</picture>
+
+# Agent Discord 
 
 A high-performance Discord bot daemon in Rust that bridges multiple coding-agent backends with a unified channel workflow.
+
+[![dependency status](https://deps.rs/repo/github/darkautism/agent-discord-rs/status.svg)](https://deps.rs/repo/github/darkautism/agent-discord-rs)
+[![][github-stars-shield]][github-stars-link]
+[![][github-issues-shield]][github-issues-shield-link]
+[![][github-contributors-shield]][github-contributors-link]
+[![][license-shield]][license-shield-link]
+[![][last-commit-shield]][last-commit-shield-link]
+
+</div>
+
+# Agent Discord
+
+
 
 ## Core Features
 
@@ -134,3 +153,20 @@ agent-discord daemon enable
 ## License
 
 MIT. See `LICENSE`.
+
+
+
+<!-- Link Definitions -->
+
+[release-shield]: https://img.shields.io/github/v/release/darkautism/agent-discord-rs?color=369eff&labelColor=black&logo=github&style=flat-square
+[release-link]: https://github.com/darkautism/agent-discord-rs/releases
+[license-shield]: https://img.shields.io/badge/license-apache%202.0-white?labelColor=black&style=flat-square
+[license-shield-link]: https://github.com/darkautism/agent-discord-rs/blob/main/LICENSE
+[last-commit-shield]: https://img.shields.io/github/last-commit/darkautism/agent-discord-rs?color=c4f042&labelColor=black&style=flat-square
+[last-commit-shield-link]: https://github.com/darkautism/agent-discord-rs/commits/main
+[github-stars-shield]: https://img.shields.io/github/stars/darkautism/agent-discord-rs?labelColor&style=flat-square&color=ffcb47
+[github-stars-link]: https://github.com/darkautism/agent-discord-rs
+[github-issues-shield]: https://img.shields.io/github/issues/darkautism/agent-discord-rs?labelColor=black&style=flat-square&color=ff80eb
+[github-issues-shield-link]: https://github.com/darkautism/agent-discord-rs/issues
+[github-contributors-shield]: https://img.shields.io/github/contributors/darkautism/agent-discord-rs?color=c4f042&labelColor=black&style=flat-square
+[github-contributors-link]: https://github.com/darkautism/agent-discord-rs/graphs/contributors
