@@ -153,8 +153,8 @@ MIT. See `LICENSE`.
 ## 
 
 <p align="center">
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/kautism)
-[![Paypal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/kautism)
+[![][ko-fi-shield]][ko-fi-shield-link]
+[![][paypal-shield]][paypal-shield-link]
 </p>
 
 
@@ -172,3 +172,8 @@ MIT. See `LICENSE`.
 [github-issues-shield-link]: https://github.com/darkautism/agent-discord-rs/issues
 [github-contributors-shield]: https://img.shields.io/github/contributors/darkautism/agent-discord-rs?color=c4f042&labelColor=black&style=flat-square
 [github-contributors-link]: https://github.com/darkautism/agent-discord-rs/graphs/contributors
+
+[ko-fi-shield]: https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white
+[ko-fi-link]: https://ko-fi.com/kautism
+[paypal-shield]: https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white
+[paypal-link]: https://paypal.me/kautism
