@@ -1,7 +1,7 @@
 <div align="center">
 
 <picture>
-   <img alt="Logo for Agent Discord" src="doc/images/banner.png" width="100%" height="auto">
+   <img alt="Logo for Agent Discord" src="doc/images/banner.jpg" width="100%" height="auto">
 </picture>
 
 # Agent Discord 
@@ -16,10 +16,6 @@ A high-performance Discord bot daemon in Rust that bridges multiple coding-agent
 [![][last-commit-shield]][last-commit-shield-link]
 
 </div>
-
-# Agent Discord
-
-
 
 ## Core Features
 
