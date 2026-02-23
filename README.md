@@ -1,7 +1,7 @@
 <div align="center">
 
 <picture>
-   <img alt="Logo for Agent Discord" src="doc/images/banner.jpg" width="100%" height="auto">
+   <img alt="Logo for Agent Discord" src="doc/images/banner.jpg" width="auto" height="400px">
 </picture>
 
 # Agent Discord 
