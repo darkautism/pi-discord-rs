@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -372,7 +373,13 @@ impl CopilotRuntime {
         });
         self.send_raw(&payload).await?;
 
-        match tokio::time::timeout(Duration::from_secs(300), rx).await {
+        let timeout = if method == "session/prompt" {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_secs(300)
+        };
+
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => anyhow::bail!("ACP response channel dropped: {}", method),
             Err(_) => {
@@ -382,11 +389,15 @@ impl CopilotRuntime {
         }
     }
 
-    fn parse_session_bootstrap(result: Value) -> anyhow::Result<SessionBootstrap> {
+    fn parse_session_bootstrap(
+        result: Value,
+        fallback_session_id: Option<&str>,
+    ) -> anyhow::Result<SessionBootstrap> {
         let session_id = result["sessionId"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing sessionId in ACP response"))?
-            .to_string();
+            .map(|s| s.to_string())
+            .or_else(|| fallback_session_id.map(|s| s.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("Missing sessionId in ACP response"))?;
 
         let models = result["models"]["availableModels"]
             .as_array()
@@ -426,7 +437,7 @@ impl CopilotRuntime {
         let result = self
             .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
             .await?;
-        let bootstrap = Self::parse_session_bootstrap(result)?;
+        let bootstrap = Self::parse_session_bootstrap(result, None)?;
         self.session_info
             .write()
             .await
@@ -441,7 +452,7 @@ impl CopilotRuntime {
                 json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
             )
             .await?;
-        let bootstrap = Self::parse_session_bootstrap(result)?;
+        let bootstrap = Self::parse_session_bootstrap(result, Some(session_id))?;
         self.session_info
             .write()
             .await
@@ -492,9 +503,10 @@ impl CopilotRuntime {
 pub struct CopilotAgent {
     runtime: Arc<CopilotRuntime>,
     channel_id: u64,
-    session_id: String,
+    session_id: StdRwLock<String>,
     event_tx: broadcast::Sender<AgentEvent>,
     message_count: AtomicU64,
+    prompt_generation: AtomicU64,
     models: Arc<RwLock<Vec<ModelInfo>>>,
     current_model: Arc<RwLock<Option<String>>>,
 }
@@ -541,9 +553,10 @@ impl CopilotAgent {
         let agent = Arc::new(Self {
             runtime,
             channel_id,
-            session_id: bootstrap.session_id.clone(),
+            session_id: StdRwLock::new(bootstrap.session_id.clone()),
             event_tx,
             message_count: AtomicU64::new(if loaded_existing { 1 } else { 0 }),
+            prompt_generation: AtomicU64::new(0),
             models: Arc::new(RwLock::new(bootstrap.info.models.clone())),
             current_model: Arc::new(RwLock::new(bootstrap.info.current_model.clone())),
         });
@@ -560,15 +573,24 @@ impl CopilotAgent {
     }
 
     pub fn session_id(&self) -> String {
-        self.session_id.clone()
+        self.session_id
+            .read()
+            .expect("copilot session_id lock poisoned")
+            .clone()
     }
 }
 
 #[async_trait]
 impl AiAgent for CopilotAgent {
     async fn prompt(&self, message: &str) -> anyhow::Result<()> {
-        match self.runtime.prompt(&self.session_id, message).await {
+        let generation = self.prompt_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let session_id = self.session_id();
+
+        match self.runtime.prompt(&session_id, message).await {
             Ok(_) => {
+                if self.prompt_generation.load(Ordering::SeqCst) != generation {
+                    return Ok(());
+                }
                 self.message_count.fetch_add(1, Ordering::SeqCst);
                 let _ = self.event_tx.send(AgentEvent::AgentEnd {
                     success: true,
@@ -577,6 +599,9 @@ impl AiAgent for CopilotAgent {
                 Ok(())
             }
             Err(e) => {
+                if self.prompt_generation.load(Ordering::SeqCst) != generation {
+                    return Ok(());
+                }
                 let err = e.to_string();
                 let _ = self.event_tx.send(AgentEvent::Error {
                     message: err.clone(),
@@ -603,12 +628,16 @@ impl AiAgent for CopilotAgent {
     }
 
     async fn compact(&self) -> anyhow::Result<()> {
-        self.runtime.prompt(&self.session_id, "/compact").await?;
+        let session_id = self.session_id();
+        self.runtime.prompt(&session_id, "/compact").await?;
         self.message_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     async fn abort(&self) -> anyhow::Result<()> {
+        // ACP currently has no session-level abort API. Keep the same session
+        // (to preserve memory) and only invalidate in-flight prompt completions.
+        self.prompt_generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -617,7 +646,8 @@ impl AiAgent for CopilotAgent {
     }
 
     async fn set_model(&self, provider: &str, model_id: &str) -> anyhow::Result<()> {
-        self.runtime.set_model(&self.session_id, model_id).await?;
+        let session_id = self.session_id();
+        self.runtime.set_model(&session_id, model_id).await?;
         {
             let mut current = self.current_model.write().await;
             *current = Some(model_id.to_string());
@@ -641,7 +671,8 @@ impl AiAgent for CopilotAgent {
     async fn get_available_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let mut models = self.models.read().await.clone();
         if models.is_empty() {
-            if let Some(info) = self.runtime.cached_session_info(&self.session_id).await {
+            let session_id = self.session_id();
+            if let Some(info) = self.runtime.cached_session_info(&session_id).await {
                 models = info.models;
                 let mut lock = self.models.write().await;
                 *lock = models.clone();
@@ -673,7 +704,10 @@ mod tests {
         let update = json!({
             "content": {"text": "abc"}
         });
-        assert_eq!(CopilotRuntime::update_text(&update), Some("abc".to_string()));
+        assert_eq!(
+            CopilotRuntime::update_text(&update),
+            Some("abc".to_string())
+        );
 
         let v = json!({"text":"hello"});
         let out = CopilotRuntime::value_text(&v);
@@ -700,7 +734,7 @@ mod tests {
                 "currentModelId": "m2"
             }
         });
-        let parsed = CopilotRuntime::parse_session_bootstrap(result).expect("parse");
+        let parsed = CopilotRuntime::parse_session_bootstrap(result, None).expect("parse");
         assert_eq!(parsed.session_id, "sid-1");
         assert_eq!(parsed.info.models.len(), 2);
         assert_eq!(parsed.info.current_model.as_deref(), Some("m2"));
@@ -816,8 +850,21 @@ mod tests {
                 "currentModelId": null
             }
         });
-        let err = CopilotRuntime::parse_session_bootstrap(result).expect_err("should fail");
+        let err = CopilotRuntime::parse_session_bootstrap(result, None).expect_err("should fail");
         assert!(err.to_string().contains("Missing sessionId"));
+    }
+
+    #[test]
+    fn test_parse_session_bootstrap_uses_fallback_session_id() {
+        let result = json!({
+            "models": {
+                "availableModels": [],
+                "currentModelId": null
+            }
+        });
+        let parsed =
+            CopilotRuntime::parse_session_bootstrap(result, Some("sid-fallback")).expect("parse");
+        assert_eq!(parsed.session_id, "sid-fallback");
     }
 
     #[test]

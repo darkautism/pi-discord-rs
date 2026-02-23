@@ -104,6 +104,7 @@
   "cron_scheduled": "下次執行時間: {0} ({1})",
   "cron_list_empty": "此頻道目前沒有排程任務。",
   "cron_list_title": "目前的排程提示詞",
+  "cron_triggered_footer": "由cron觸發",
   "cron_delete_placeholder": "選擇要刪除的排程...",
   "cron_deleted": "✅ 已刪除排程: {0}",
   "cmd_cron_desc": "在當前頻道設定定期的 AI 提示詞",

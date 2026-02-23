@@ -94,7 +94,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         // SAFETY: serialized by env lock
         unsafe { std::env::set_var(BASE_DIR_ENV, dir.path()) };
-        let err = Config::load().await.expect_err("first load should create default and fail");
+        let err = Config::load()
+            .await
+            .expect_err("first load should create default and fail");
         assert!(err.to_string().contains("Configuration file not found"));
         assert!(dir.path().join("config.toml").exists());
         // SAFETY: serialized by env lock

@@ -295,7 +295,10 @@ pub async fn handle_config_select(
 
             let msg = {
                 let i18n = state.i18n.read().await;
-                i18n.get_args("config_assistant_set", &[state.config.assistant_name.clone()])
+                i18n.get_args(
+                    "config_assistant_set",
+                    &[state.config.assistant_name.clone()],
+                )
             };
 
             interaction
@@ -365,8 +368,8 @@ mod tests {
         extract_selected_value, parse_config_select_action, sanitize_assistant_name,
         ConfigSelectAction,
     };
-    use serenity::all::ComponentInteractionDataKind;
     use crate::agent::AgentType;
+    use serenity::all::ComponentInteractionDataKind;
 
     #[test]
     fn test_sanitize_assistant_name_strips_controls_and_limits_length() {
@@ -394,10 +397,7 @@ mod tests {
         let kind = ComponentInteractionDataKind::StringSelect {
             values: vec!["opencode".to_string()],
         };
-        assert_eq!(
-            extract_selected_value(&kind).as_deref(),
-            Some("opencode")
-        );
+        assert_eq!(extract_selected_value(&kind).as_deref(), Some("opencode"));
     }
 
     #[test]

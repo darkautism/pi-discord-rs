@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, Level};
+use tracing::{debug, error, info, warn, Level};
 
 mod cron;
 mod i18n;
@@ -191,7 +191,7 @@ impl Handler {
         // --- 任務啟動：收集所有 Handles ---
         let mut handles = Vec::new();
 
-        if let Some(mut input) = initial_input {
+        let prompt_input = if let Some(mut input) = initial_input {
             let mut final_msg = input.text;
             if is_brand_new {
                 let prompts = load_all_prompts();
@@ -200,23 +200,10 @@ impl Handler {
                 }
             }
             input.text = final_msg;
-            let agent_for_prompt = Arc::clone(&agent);
-            let status_for_prompt = Arc::clone(&status);
-            let composer_for_prompt = Arc::clone(&composer);
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = agent_for_prompt.prompt_with_input(&input).await {
-                    let mut s = status_for_prompt.lock().await;
-                    let comp = composer_for_prompt.lock().await;
-                    if *s == ExecStatus::Running {
-                        if comp.blocks.is_empty() {
-                            *s = ExecStatus::Error(e.to_string());
-                        } else {
-                            info!("⚠️ POST prompt reported error: {}, but SSE stream is active. Continuing...", e);
-                        }
-                    }
-                }
-            }));
-        }
+            Some(input)
+        } else {
+            None
+        };
 
         let typing_http = http.clone();
         let typing_status = Arc::clone(&status);
@@ -260,7 +247,10 @@ impl Handler {
                     let i18n = render_i18n.read().await;
                     let (title, color, body) =
                         build_render_view(&i18n, &current_status, &desc, &render_assistant_name);
-                    let embed = CreateEmbed::new().title(title).color(color).description(body);
+                    let embed = CreateEmbed::new()
+                        .title(title)
+                        .color(color)
+                        .description(body);
 
                     if let Err(e) = render_msg
                         .edit(&render_http, EditMessage::new().embed(embed))
@@ -300,6 +290,7 @@ impl Handler {
         let mut rx = agent.subscribe_events();
         let writer_status = Arc::clone(&status);
         let writer_composer = Arc::clone(&composer);
+        let writer_agent_type = agent.agent_type().to_string();
         let writer_task = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -307,6 +298,12 @@ impl Handler {
                         let mut comp = writer_composer.lock().await;
                         let mut s = writer_status.lock().await;
                         let finished = apply_agent_event(&mut comp, &mut s, event);
+                        if finished && *s == ExecStatus::Success && comp.blocks.is_empty() {
+                            warn!(
+                                "⚠️ Empty success response detected: channel={}, agent={}",
+                                channel_id_u64, writer_agent_type
+                            );
+                        }
                         drop(comp);
                         drop(s);
                         if finished {
@@ -322,6 +319,25 @@ impl Handler {
                 tokio::task::yield_now().await;
             }
         });
+
+        if let Some(input) = prompt_input {
+            let agent_for_prompt = Arc::clone(&agent);
+            let status_for_prompt = Arc::clone(&status);
+            let composer_for_prompt = Arc::clone(&composer);
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = agent_for_prompt.prompt_with_input(&input).await {
+                    let mut s = status_for_prompt.lock().await;
+                    let comp = composer_for_prompt.lock().await;
+                    if *s == ExecStatus::Running {
+                        if comp.blocks.is_empty() {
+                            *s = ExecStatus::Error(e.to_string());
+                        } else {
+                            info!("⚠️ POST prompt reported error: {}, but SSE stream is active. Continuing...", e);
+                        }
+                    }
+                }
+            }));
+        }
 
         // 登記新任務
         handles.push(render_task);
@@ -402,9 +418,7 @@ impl EventHandler for Handler {
                         let i18n = self.state.i18n.read().await;
                         i18n.get_args("auth_required_cmd", &[token])
                     };
-                    let _ = msg
-                        .reply(&ctx.http, auth_msg)
-                        .await;
+                    let _ = msg.reply(&ctx.http, auth_msg).await;
                 }
             }
             return;
@@ -516,8 +530,9 @@ impl EventHandler for Handler {
                 ModalRoute::ConfigAssistant => {
                     let state = self.state.clone();
                     tokio::spawn(async move {
-                        let _ = commands::config::handle_assistant_modal_submit(&ctx, &modal, &state)
-                            .await;
+                        let _ =
+                            commands::config::handle_assistant_modal_submit(&ctx, &modal, &state)
+                                .await;
                     });
                 }
                 ModalRoute::Ignore => {}
@@ -526,7 +541,8 @@ impl EventHandler for Handler {
             let custom_id = component.data.custom_id.as_str();
             match route_component(custom_id) {
                 ComponentRoute::Config => {
-                    let _ = commands::config::handle_config_select(&ctx, &component, &self.state).await;
+                    let _ =
+                        commands::config::handle_config_select(&ctx, &component, &self.state).await;
                 }
                 ComponentRoute::Agent => {
                     let _ = handle_button(&ctx, &component, &self.state).await;
@@ -534,7 +550,8 @@ impl EventHandler for Handler {
                 ComponentRoute::CronDelete => {
                     let state = self.state.clone();
                     tokio::spawn(async move {
-                        let _ = commands::cron::handle_delete_select(&ctx, &component, &state).await;
+                        let _ =
+                            commands::cron::handle_delete_select(&ctx, &component, &state).await;
                     });
                 }
                 ComponentRoute::ModelSelect => {
@@ -553,9 +570,10 @@ impl EventHandler for Handler {
                             )
                             .await
                         {
-                            let _ =
-                                commands::model::handle_model_select(&ctx, &component, agent, &state)
-                                    .await;
+                            let _ = commands::model::handle_model_select(
+                                &ctx, &component, agent, &state,
+                            )
+                            .await;
                         }
                     });
                 }

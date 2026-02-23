@@ -178,14 +178,24 @@ mod tests {
 
     #[test]
     fn test_should_process_message_rules() {
-        assert!(!should_process_message(true, MessageType::Regular, false, false));
+        assert!(!should_process_message(
+            true,
+            MessageType::Regular,
+            false,
+            false
+        ));
         assert!(!should_process_message(
             false,
             MessageType::ThreadStarterMessage,
             false,
             false
         ));
-        assert!(!should_process_message(false, MessageType::Regular, true, false));
+        assert!(!should_process_message(
+            false,
+            MessageType::Regular,
+            true,
+            false
+        ));
         assert!(should_process_message(
             false,
             MessageType::InlineReply,
@@ -203,18 +213,26 @@ mod tests {
         );
         assert_eq!(route_modal("other"), ModalRoute::Ignore);
 
-        assert_eq!(route_component("config_backend_select"), ComponentRoute::Config);
+        assert_eq!(
+            route_component("config_backend_select"),
+            ComponentRoute::Config
+        );
         assert_eq!(route_component("agent_confirm:kilo"), ComponentRoute::Agent);
-        assert_eq!(route_component("cron_delete_select"), ComponentRoute::CronDelete);
-        assert_eq!(route_component("model_select_0"), ComponentRoute::ModelSelect);
+        assert_eq!(
+            route_component("cron_delete_select"),
+            ComponentRoute::CronDelete
+        );
+        assert_eq!(
+            route_component("model_select_0"),
+            ComponentRoute::ModelSelect
+        );
         assert_eq!(route_component("x"), ComponentRoute::Ignore);
     }
 
     #[test]
     fn test_build_render_view_uses_i18n_values() {
         let i18n = I18n::new("en");
-        let (title, color, desc) =
-            build_render_view(&i18n, &ExecStatus::Running, "", "AgentX");
+        let (title, color, desc) = build_render_view(&i18n, &ExecStatus::Running, "", "AgentX");
         assert!(title.contains("AgentX"));
         assert_eq!(color, 0xFFA500);
         assert_eq!(desc, i18n.get("wait"));

@@ -311,7 +311,9 @@ mod tests {
 
     #[test]
     fn test_binary_not_found_detection() {
-        assert!(is_binary_not_found("Spawn failed: No such file or directory"));
+        assert!(is_binary_not_found(
+            "Spawn failed: No such file or directory"
+        ));
         assert!(is_binary_not_found("ENOENT: not found"));
         assert!(!is_binary_not_found("connection refused"));
     }
@@ -332,7 +334,8 @@ mod tests {
     #[test]
     fn test_backend_error_message_for_opencode_has_start_command() {
         let i18n = I18n::new("en");
-        let msg = build_backend_error_message(&i18n, AgentType::Opencode, "connection refused", 4096);
+        let msg =
+            build_backend_error_message(&i18n, AgentType::Opencode, "connection refused", 4096);
         assert!(msg.contains("opencode serve --port 4096"));
         assert!(msg.contains("Failed to start opencode backend"));
     }

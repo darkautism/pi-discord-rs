@@ -104,6 +104,7 @@
   "cron_scheduled": "Next: {0} ({1})",
   "cron_list_empty": "No scheduled tasks in this channel.",
   "cron_list_title": "Scheduled Prompts",
+  "cron_triggered_footer": "Triggered by cron",
   "cron_delete_placeholder": "Select a task to delete",
   "cron_deleted": "✅ Task deleted: {0}",
   "cmd_cron_desc": "Schedule a recurring AI prompt for this channel",

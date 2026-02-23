@@ -1,5 +1,5 @@
-use crate::agent::AgentType;
 use crate::agent::runtime;
+use crate::agent::AgentType;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

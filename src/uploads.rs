@@ -17,7 +17,11 @@ pub struct UploadManager {
 }
 
 impl UploadManager {
-    pub fn new(max_file_bytes: u64, ttl: Duration, cleanup_interval: Duration) -> anyhow::Result<Self> {
+    pub fn new(
+        max_file_bytes: u64,
+        ttl: Duration,
+        cleanup_interval: Duration,
+    ) -> anyhow::Result<Self> {
         let root = migrate::get_uploads_dir();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
@@ -46,16 +50,17 @@ impl UploadManager {
             if attachment.size > self.max_file_bytes as u32 {
                 warn!(
                     "Skipping attachment '{}' ({} bytes > max {} bytes)",
-                    attachment.filename,
-                    attachment.size,
-                    self.max_file_bytes
+                    attachment.filename, attachment.size, self.max_file_bytes
                 );
                 continue;
             }
 
             match self.download_one(channel_id, attachment).await {
                 Ok(file) => out.push(file),
-                Err(e) => warn!("Failed to stage attachment '{}': {}", attachment.filename, e),
+                Err(e) => warn!(
+                    "Failed to stage attachment '{}': {}",
+                    attachment.filename, e
+                ),
             }
         }
 
@@ -150,7 +155,11 @@ impl UploadManager {
         Ok(())
     }
 
-    async fn download_one(&self, channel_id: u64, attachment: &Attachment) -> anyhow::Result<UploadedFile> {
+    async fn download_one(
+        &self,
+        channel_id: u64,
+        attachment: &Attachment,
+    ) -> anyhow::Result<UploadedFile> {
         let url = if !attachment.url.is_empty() {
             attachment.url.as_str()
         } else {

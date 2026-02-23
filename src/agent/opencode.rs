@@ -136,7 +136,10 @@ impl OpencodeAgent {
         Ok(agent)
     }
 
-    async fn construct_message_body(input: &UserInput, model_opt: &Option<(String, String)>) -> Value {
+    async fn construct_message_body(
+        input: &UserInput,
+        model_opt: &Option<(String, String)>,
+    ) -> Value {
         let (text, extra_parts) = Self::build_parts_from_input(input).await;
         let mut parts = vec![json!({ "type": "text", "text": text })];
         parts.extend(extra_parts);
@@ -219,10 +222,14 @@ impl OpencodeAgent {
                 });
             }
             RealtimeEventAction::ToolStart { id, name } => {
-                let _ = self.event_tx.send(AgentEvent::ToolExecutionStart { id, name });
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolExecutionStart { id, name });
             }
             RealtimeEventAction::ToolUpdate { id, output } => {
-                let _ = self.event_tx.send(AgentEvent::ToolExecutionUpdate { id, output });
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolExecutionUpdate { id, output });
             }
             RealtimeEventAction::TurnCompleted => {
                 info!("🏁 Turn completed signal received: {}", type_);
@@ -313,7 +320,9 @@ impl OpencodeAgent {
             let status = part_info["state"]["status"].as_str().unwrap_or("");
             if status == "running" || status == "pending" {
                 let name = part_info["tool"].as_str().unwrap_or("tool");
-                let cmd = part_info["state"]["input"]["command"].as_str().unwrap_or("");
+                let cmd = part_info["state"]["input"]["command"]
+                    .as_str()
+                    .unwrap_or("");
                 return RealtimeEventAction::ToolStart {
                     id,
                     name: format!("🛠️ `{}`: `{}`", name, cmd),
@@ -875,7 +884,10 @@ mod tests {
     fn test_extract_error_message_fallbacks() {
         let properties = json!({"message":"p-msg"});
         let data = json!({"message":"d-msg"});
-        assert_eq!(OpencodeAgent::extract_error_message(&properties, &data), "p-msg");
+        assert_eq!(
+            OpencodeAgent::extract_error_message(&properties, &data),
+            "p-msg"
+        );
 
         let properties2 = json!({});
         assert_eq!(
@@ -1069,10 +1081,7 @@ mod tests {
         let (agent, _) = build_test_agent(&mock_server, "k", "sid");
         agent.set_model("openai", "gpt-4.1").await?;
         let model = agent.current_model.lock().await.clone();
-        assert_eq!(
-            model,
-            Some(("openai".to_string(), "gpt-4.1".to_string()))
-        );
+        assert_eq!(model, Some(("openai".to_string(), "gpt-4.1".to_string())));
         // SAFETY: serialized by env lock
         unsafe { std::env::remove_var(BASE_DIR_ENV) };
         Ok(())

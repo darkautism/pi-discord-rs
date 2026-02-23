@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
+use serenity::all::{CreateEmbed, CreateEmbedFooter, CreateMessage};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -128,6 +129,36 @@ impl CronManager {
                 {
                     if let Some(state) = state_weak.upgrade() {
                         let channel_id = serenity::model::id::ChannelId::from(channel_id_u64);
+                        let cron_footer = {
+                            let i18n = state.i18n.read().await;
+                            i18n.get("cron_triggered_footer")
+                        };
+                        if let Err(e) = channel_id
+                            .send_message(
+                                http,
+                                CreateMessage::new().embed(
+                                    CreateEmbed::new()
+                                        .description(prompt.clone())
+                                        .footer(CreateEmbedFooter::new(cron_footer)),
+                                ),
+                            )
+                            .await
+                        {
+                            warn!("⚠️ Failed to send cron trigger embed: {}", e);
+                        }
+
+                        let has_active_render = {
+                            let active = state.active_renders.lock().await;
+                            active.contains_key(&channel_id_u64)
+                        };
+                        if has_active_render {
+                            info!(
+                                "⏭️ Cron job skipped for channel {} because an active render is running",
+                                channel_id_u64
+                            );
+                            return;
+                        }
+
                         let channel_id_str = channel_id.to_string();
 
                         let channel_config = crate::commands::agent::ChannelConfig::load()

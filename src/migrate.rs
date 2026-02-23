@@ -259,7 +259,7 @@ port = 4096
         fs::write(&new_config, final_content).await?;
     } else {
         // 創建默認配置
-let default_config = r#"discord_token = "YOUR_DISCORD_TOKEN_HERE"
+        let default_config = r#"discord_token = "YOUR_DISCORD_TOKEN_HERE"
 debug_level = "INFO"
 language = "zh-TW"
 assistant_name = "Agent"
@@ -362,7 +362,9 @@ mod tests {
         let old_cfg = old.path().join("config.toml");
         let new_cfg = newd.path().join("config.toml");
 
-        fs::write(&old_cfg, "discord_token = \"REAL_TOKEN\"").await.expect("write old");
+        fs::write(&old_cfg, "discord_token = \"REAL_TOKEN\"")
+            .await
+            .expect("write old");
         fs::write(
             &new_cfg,
             "discord_token = \"YOUR_DISCORD_TOKEN_HERE\"\nlanguage = \"zh-TW\"",

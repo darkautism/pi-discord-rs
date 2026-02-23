@@ -1,6 +1,7 @@
 use super::SlashCommand;
 use async_trait::async_trait;
 use serenity::all::{CommandInteraction, Context, EditInteractionResponse};
+use tracing::warn;
 
 pub struct AbortCommand;
 
@@ -21,6 +22,19 @@ impl SlashCommand for AbortCommand {
         state: &crate::AppState,
     ) -> anyhow::Result<()> {
         command.defer_ephemeral(&ctx.http).await?;
+
+        let active = {
+            let mut active = state.active_renders.lock().await;
+            active.remove(&command.channel_id.get())
+        };
+        if let Some((msg_id, handles)) = active {
+            for handle in handles {
+                handle.abort();
+            }
+            if let Err(e) = command.channel_id.delete_message(&ctx.http, msg_id).await {
+                warn!("Failed to delete aborted in-flight message: {}", e);
+            }
+        }
 
         let channel_id_str = command.channel_id.to_string();
         let channel_config = crate::commands::agent::ChannelConfig::load()
