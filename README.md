@@ -150,6 +150,12 @@ agent-discord daemon enable
 
 MIT. See `LICENSE`.
 
+## 
+
+<p align="center">
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/kautism)
+[![Paypal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/kautism)
+</p>
 
 
 <!-- Link Definitions -->
