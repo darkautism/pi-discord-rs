@@ -150,12 +150,13 @@ agent-discord daemon enable
 
 MIT. See `LICENSE`.
 
-## 
 
-<p align="center">
-[![][ko-fi-shield]][ko-fi-shield-link]
-[![][paypal-shield]][paypal-shield-link]
-</p>
+## Support the Project
+
+If this project has saved you time or helped you in your workflow, consider supporting its continued development. Your contribution helps me keep the project maintained and feature-rich!
+
+[![][ko-fi-shield]][ko-fi-link]
+[![][paypal-shield]][paypal-link]
 
 
 <!-- Link Definitions -->
@@ -172,7 +173,6 @@ MIT. See `LICENSE`.
 [github-issues-shield-link]: https://github.com/darkautism/agent-discord-rs/issues
 [github-contributors-shield]: https://img.shields.io/github/contributors/darkautism/agent-discord-rs?color=c4f042&labelColor=black&style=flat-square
 [github-contributors-link]: https://github.com/darkautism/agent-discord-rs/graphs/contributors
-
 [ko-fi-shield]: https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white
 [ko-fi-link]: https://ko-fi.com/kautism
 [paypal-shield]: https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white
