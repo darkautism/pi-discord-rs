@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, PartialEq)]
 enum RealtimeEventAction {
@@ -452,13 +452,10 @@ impl AiAgent for OpencodeAgent {
 
                     let status = resp.status();
                     if status == 404 {
-                        let mut config = crate::commands::agent::ChannelConfig::load().await?;
-                        if let Some(entry) = config.channels.get_mut(&self.channel_id.to_string()) {
-                            entry.session_id = None;
-                            if let Err(e) = config.save().await {
-                                error!("❌ Failed to clear expired session id: {}", e);
-                            }
-                        }
+                        warn!(
+                            "⚠️ Session {} returned 404 on prompt for channel {}; preserving sid for non-destructive recovery",
+                            self.session_id, self.channel_id
+                        );
                         let _ = self.event_tx.send(AgentEvent::AgentEnd {
                             success: false,
                             error: Some("Session expired. Please retry.".into()),
@@ -514,13 +511,10 @@ impl AiAgent for OpencodeAgent {
             });
         }
         if resp.status() == 404 {
-            let mut config = crate::commands::agent::ChannelConfig::load().await?;
-            if let Some(entry) = config.channels.get_mut(&self.channel_id.to_string()) {
-                entry.session_id = None;
-                if let Err(e) = config.save().await {
-                    error!("❌ Failed to clear missing session id: {}", e);
-                }
-            }
+            warn!(
+                "⚠️ Session {} returned 404 on state check for channel {}; preserving sid for non-destructive recovery",
+                self.session_id, self.channel_id
+            );
         }
         Ok(AgentState {
             message_count: 0,

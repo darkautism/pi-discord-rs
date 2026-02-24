@@ -35,6 +35,10 @@ impl SlashCommand for AbortCommand {
                 warn!("Failed to delete aborted in-flight message: {}", e);
             }
         }
+        {
+            let mut pending = state.pending_inputs.lock().await;
+            pending.remove(&command.channel_id.get());
+        }
 
         let channel_id_str = command.channel_id.to_string();
         let channel_config = crate::commands::agent::ChannelConfig::load()

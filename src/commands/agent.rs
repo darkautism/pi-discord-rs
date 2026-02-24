@@ -33,7 +33,7 @@ pub fn build_backend_error_message(
     if is_binary_not_found(error_text) {
         let install_cmd = match agent_type {
             AgentType::Pi => "npm i -g @mariozechner/pi-coding-agent",
-            AgentType::Opencode => "npm i -g opencode-ai@latest",
+            AgentType::Opencode => "npm install -g @opencode-ai/cli",
             AgentType::Kilo => "npm i -g @kilocode/cli",
             AgentType::Copilot => "npm i -g @github/copilot",
         };

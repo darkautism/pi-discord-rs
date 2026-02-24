@@ -53,6 +53,12 @@ struct CopilotRuntime {
     session_senders: RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>,
     session_info: RwLock<HashMap<String, SessionInfoCache>>,
     next_id: AtomicU64,
+    /// Ensures only one session/prompt ACP call is in-flight at a time.
+    prompt_lock: Mutex<()>,
+    /// ID of the currently in-flight session/prompt request (if any).
+    /// Used by cancel() to force-resolve the oneshot from our side,
+    /// guaranteeing prompt_lock is released immediately on abort.
+    active_prompt_id: Mutex<Option<u64>>,
 }
 
 impl CopilotRuntime {
@@ -103,6 +109,8 @@ impl CopilotRuntime {
             session_senders: RwLock::new(HashMap::new()),
             session_info: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            prompt_lock: Mutex::new(()),
+            active_prompt_id: Mutex::new(None),
         });
 
         Self::spawn_stdout_reader(Arc::clone(&runtime), stdout);
@@ -472,14 +480,72 @@ impl CopilotRuntime {
     }
 
     async fn prompt(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
-        self.request(
-            "session/prompt",
-            json!({
+        // Serialise all session/prompt calls so we never send a new prompt while
+        // Copilot is still processing the previous one.  When /abort is called,
+        // cancel() force-resolves the active oneshot, which causes the rx below to
+        // return immediately with an error — releasing this lock right away.
+        let _prompt_guard = self.prompt_lock.lock().await;
+        self.ensure_alive().await?;
+
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        *self.active_prompt_id.lock().await = Some(id);
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": {
                 "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": message }]
-            }),
-        )
-        .await?;
+            }
+        });
+
+        if let Err(e) = self.send_raw(&payload).await {
+            self.pending.lock().await.remove(&id);
+            *self.active_prompt_id.lock().await = None;
+            return Err(e);
+        }
+
+        let result = match tokio::time::timeout(Duration::from_secs(3600), rx).await {
+            Ok(Ok(val)) => val,
+            Ok(Err(_)) => {
+                *self.active_prompt_id.lock().await = None;
+                anyhow::bail!("ACP response channel dropped: session/prompt");
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                *self.active_prompt_id.lock().await = None;
+                anyhow::bail!("ACP request timeout: session/prompt");
+            }
+        };
+
+        *self.active_prompt_id.lock().await = None;
+        result?;
+        Ok(())
+    }
+
+    async fn cancel(&self, session_id: &str) -> anyhow::Result<()> {
+        // Force-resolve the in-flight session/prompt request from our side.
+        // This wakes up the rx.await in prompt(), which returns an error,
+        // clears active_prompt_id, and drops prompt_lock — all immediately,
+        // without waiting for Copilot to send a JSON-RPC response.
+        let maybe_id = *self.active_prompt_id.lock().await;
+        if let Some(id) = maybe_id {
+            let tx = self.pending.lock().await.remove(&id);
+            if let Some(tx) = tx {
+                let _ = tx.send(Err(anyhow::anyhow!("Cancelled by user")));
+            }
+        }
+
+        // Also tell Copilot to stop its internal work (best-effort).
+        if let Err(e) = self
+            .request("session/cancel", json!({ "sessionId": session_id }))
+            .await
+        {
+            warn!("session/cancel to Copilot failed (may be benign): {e}");
+        }
         Ok(())
     }
 
@@ -578,6 +644,50 @@ impl CopilotAgent {
             .expect("copilot session_id lock poisoned")
             .clone()
     }
+
+    fn is_meaningful_stream_event(event: &AgentEvent) -> bool {
+        match event {
+            AgentEvent::MessageUpdate { thinking, text, .. } => {
+                !thinking.is_empty() || !text.is_empty()
+            }
+            AgentEvent::ContentSync { items } => !items.is_empty(),
+            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionUpdate { .. } => true,
+            _ => false,
+        }
+    }
+
+    async fn wait_for_stream_output(
+        &self,
+        rx: &mut broadcast::Receiver<AgentEvent>,
+        generation: u64,
+    ) -> bool {
+        const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+        const IDLE_AFTER_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let mut timeout = FIRST_EVENT_TIMEOUT;
+        let mut saw_output = false;
+
+        loop {
+            if self.prompt_generation.load(Ordering::SeqCst) != generation {
+                return false;
+            }
+
+            match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Ok(event)) => {
+                    if Self::is_meaningful_stream_event(&event) {
+                        saw_output = true;
+                        timeout = IDLE_AFTER_EVENT_TIMEOUT;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                    saw_output = true;
+                    timeout = IDLE_AFTER_EVENT_TIMEOUT;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return saw_output,
+                Err(_) => return saw_output,
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -585,11 +695,33 @@ impl AiAgent for CopilotAgent {
     async fn prompt(&self, message: &str) -> anyhow::Result<()> {
         let generation = self.prompt_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session_id = self.session_id();
+        let mut stream_rx = self.event_tx.subscribe();
 
         match self.runtime.prompt(&session_id, message).await {
             Ok(_) => {
                 if self.prompt_generation.load(Ordering::SeqCst) != generation {
                     return Ok(());
+                }
+                let saw_output = self
+                    .wait_for_stream_output(&mut stream_rx, generation)
+                    .await;
+                if self.prompt_generation.load(Ordering::SeqCst) != generation {
+                    return Ok(());
+                }
+                if !saw_output {
+                    let err = "Copilot produced no stream output; please retry.".to_string();
+                    warn!(
+                        "⚠️ Copilot empty response detected: channel={}, session={}",
+                        self.channel_id, session_id
+                    );
+                    let _ = self.event_tx.send(AgentEvent::Error {
+                        message: err.clone(),
+                    });
+                    let _ = self.event_tx.send(AgentEvent::AgentEnd {
+                        success: false,
+                        error: Some(err.clone()),
+                    });
+                    anyhow::bail!(err);
                 }
                 self.message_count.fetch_add(1, Ordering::SeqCst);
                 let _ = self.event_tx.send(AgentEvent::AgentEnd {
@@ -635,9 +767,19 @@ impl AiAgent for CopilotAgent {
     }
 
     async fn abort(&self) -> anyhow::Result<()> {
-        // ACP currently has no session-level abort API. Keep the same session
-        // (to preserve memory) and only invalidate in-flight prompt completions.
+        // Invalidate in-flight prompt completions first so stale responses are
+        // silently dropped regardless of whether the cancel reaches Copilot.
         self.prompt_generation.fetch_add(1, Ordering::SeqCst);
+
+        // Ask Copilot to stop processing the current prompt.  This causes the
+        // pending session/prompt ACP call to return early, releasing prompt_lock
+        // so the next prompt can start immediately instead of waiting for the
+        // old generation to fully finish.
+        let session_id = self.session_id();
+        if let Err(e) = self.runtime.cancel(&session_id).await {
+            // Non-fatal: if there's no active prompt, cancel may fail.
+            warn!("session/cancel failed (may be benign): {e}");
+        }
         Ok(())
     }
 

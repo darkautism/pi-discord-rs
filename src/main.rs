@@ -9,7 +9,7 @@ use serenity::async_trait;
 use serenity::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn, Level};
 
@@ -74,6 +74,8 @@ enum DaemonAction {
 struct DefaultPrompts;
 
 type ActiveRenderMap = HashMap<u64, (serenity::model::id::MessageId, Vec<JoinHandle<()>>)>;
+type PendingInputMap = HashMap<u64, UserInput>;
+type QueuedLoopRequest = (u64, UserInput);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -84,6 +86,8 @@ pub struct AppState {
     pub backend_manager: Arc<agent::manager::BackendManager>,
     pub cron_manager: Arc<CronManager>,
     pub active_renders: Arc<Mutex<ActiveRenderMap>>,
+    pub pending_inputs: Arc<Mutex<PendingInputMap>>,
+    pub queued_loop_tx: mpsc::UnboundedSender<QueuedLoopRequest>,
     pub upload_manager: Arc<UploadManager>,
 }
 
@@ -116,6 +120,19 @@ fn load_all_prompts() -> String {
         .join("\n\n")
 }
 
+fn should_auto_recover_request_error(agent_type: &str, error_text: &str) -> bool {
+    if agent_type != "kilo" && agent_type != "opencode" {
+        return false;
+    }
+
+    let lower = error_text.to_lowercase();
+    lower.contains("error sending request for url")
+        || lower.contains("connection refused")
+        || lower.contains("tcp connect error")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+}
+
 pub struct Handler {
     state: AppState,
 }
@@ -137,24 +154,24 @@ impl Handler {
         is_brand_new: bool,
     ) {
         let channel_id_u64 = channel_id.get();
+        let mut initial_input = initial_input;
 
-        // 1. [搶佔邏輯]: 如果該頻道有正在運行的任務，立即中斷並刪除該訊息
+        // 1. 若該頻道已有執行中任務，將新輸入排隊（覆蓋舊排隊）而不是硬中止。
         {
-            let mut active = state.active_renders.lock().await;
-            if let Some((old_msg_id, handles)) = active.remove(&channel_id_u64) {
-                for h in handles {
-                    h.abort();
+            let has_active = {
+                let active = state.active_renders.lock().await;
+                active.contains_key(&channel_id_u64)
+            };
+            if has_active {
+                if let Some(input) = initial_input.take() {
+                    let mut pending = state.pending_inputs.lock().await;
+                    pending.insert(channel_id_u64, input);
+                    info!(
+                        "⏳ Queued input for channel {} while render is running",
+                        channel_id_u64
+                    );
                 }
-                let http_del = http.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = channel_id.delete_message(&http_del, old_msg_id).await {
-                        error!("❌ Failed to delete preempted message: {}", e);
-                    }
-                });
-                info!(
-                    "🗑️ Preempted unfinished response in channel {}",
-                    channel_id_u64
-                );
+                return;
             }
         }
 
@@ -270,15 +287,36 @@ impl Handler {
                 }
 
                 if current_status != ExecStatus::Running {
+                    let mut should_start_queued = false;
                     // 完工：從活躍任務中移除自己
                     let mut active = render_state.active_renders.lock().await;
                     if let Some((active_msg_id, _)) = active.get(&channel_id_u64) {
                         if *active_msg_id == render_msg_id {
                             active.remove(&channel_id_u64);
+                            should_start_queued = true;
                             info!(
                                 "✅ Completed response registered as historical for channel {}",
                                 channel_id_u64
                             );
+                        }
+                    }
+                    drop(active);
+
+                    if should_start_queued {
+                        let next_input = {
+                            let mut pending = render_state.pending_inputs.lock().await;
+                            pending.remove(&channel_id_u64)
+                        };
+                        if let Some(next_input) = next_input {
+                            if let Err(e) = render_state
+                                .queued_loop_tx
+                                .send((channel_id_u64, next_input))
+                            {
+                                warn!(
+                                    "⚠️ Failed to dispatch queued input for channel {}: {}",
+                                    channel_id_u64, e
+                                );
+                            }
                         }
                     }
                     break;
@@ -293,8 +331,8 @@ impl Handler {
         let writer_agent_type = agent.agent_type().to_string();
         let writer_task = tokio::spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(event) => {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                    Ok(Ok(event)) => {
                         let mut comp = writer_composer.lock().await;
                         let mut s = writer_status.lock().await;
                         let finished = apply_agent_event(&mut comp, &mut s, event);
@@ -310,11 +348,17 @@ impl Handler {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                         info!("⚠️ Writer lagged by {} messages", n);
                         continue;
                     }
-                    Err(_) => break,
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        let s = writer_status.lock().await;
+                        if *s != ExecStatus::Running {
+                            break;
+                        }
+                    }
                 }
                 tokio::task::yield_now().await;
             }
@@ -324,19 +368,78 @@ impl Handler {
             let agent_for_prompt = Arc::clone(&agent);
             let status_for_prompt = Arc::clone(&status);
             let composer_for_prompt = Arc::clone(&composer);
-            handles.push(tokio::spawn(async move {
+            let state_for_prompt = state.clone();
+            let prompt_agent_type = agent.agent_type().to_string();
+            // Detach the prompt task from the abortable display-task handles.
+            // When /abort fires it only kills render_task + writer_task (the UI
+            // tasks).  The prompt task continues in the background so the
+            // underlying backend (especially Copilot, which has no abort API)
+            // finishes naturally before the next prompt is dispatched.
+            // For Copilot the prompt_lock in CopilotRuntime serialises this.
+            tokio::spawn(async move {
                 if let Err(e) = agent_for_prompt.prompt_with_input(&input).await {
+                    let err_text = e.to_string();
+                    let recoverable_request_error =
+                        should_auto_recover_request_error(&prompt_agent_type, &err_text);
+                    let mut has_no_stream_output = {
+                        let comp = composer_for_prompt.lock().await;
+                        comp.blocks.is_empty()
+                    };
+                    if recoverable_request_error && has_no_stream_output {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        has_no_stream_output = {
+                            let comp = composer_for_prompt.lock().await;
+                            comp.blocks.is_empty()
+                        };
+                        if !has_no_stream_output {
+                            info!(
+                                "⚠️ POST prompt reported recoverable error: {}, but stream became active. Continuing...",
+                                err_text
+                            );
+                            return;
+                        }
+                    }
+
+                    let mut queued_recovery = false;
+                    if has_no_stream_output && recoverable_request_error {
+                        let is_still_running = {
+                            let s = status_for_prompt.lock().await;
+                            *s == ExecStatus::Running
+                        };
+                        if !is_still_running {
+                            return;
+                        }
+                        state_for_prompt
+                            .session_manager
+                            .remove_session(channel_id_u64)
+                            .await;
+                        let mut pending = state_for_prompt.pending_inputs.lock().await;
+                        pending
+                            .entry(channel_id_u64)
+                            .or_insert_with(|| input.clone());
+                        queued_recovery = true;
+                        warn!(
+                            "♻️ Auto-recovery queued for channel {} ({}) due to backend request failure: {}",
+                            channel_id_u64, prompt_agent_type, err_text
+                        );
+                    }
+
                     let mut s = status_for_prompt.lock().await;
-                    let comp = composer_for_prompt.lock().await;
                     if *s == ExecStatus::Running {
-                        if comp.blocks.is_empty() {
-                            *s = ExecStatus::Error(e.to_string());
+                        if has_no_stream_output {
+                            if queued_recovery {
+                                *s = ExecStatus::Error(
+                                    "Backend temporary failure, auto-retrying...".to_string(),
+                                );
+                            } else {
+                                *s = ExecStatus::Error(err_text);
+                            }
                         } else {
                             info!("⚠️ POST prompt reported error: {}, but SSE stream is active. Continuing...", e);
                         }
                     }
                 }
-            }));
+            });
         }
 
         // 登記新任務
@@ -587,6 +690,7 @@ async fn run_bot() -> anyhow::Result<()> {
     migrate::run_migrations().await?;
     let config = Arc::new(Config::load().await?);
     let cron_manager = Arc::new(CronManager::new().await?);
+    let (queued_loop_tx, mut queued_loop_rx) = mpsc::unbounded_channel::<QueuedLoopRequest>();
     if let Err(e) = cron_manager.load_from_disk().await {
         error!("❌ Failed to load cron jobs from disk: {}", e);
     }
@@ -598,6 +702,8 @@ async fn run_bot() -> anyhow::Result<()> {
         backend_manager: Arc::new(agent::manager::BackendManager::new(config.clone())),
         cron_manager,
         active_renders: Arc::new(Mutex::new(HashMap::new())),
+        pending_inputs: Arc::new(Mutex::new(HashMap::new())),
+        queued_loop_tx,
         upload_manager: Arc::new(UploadManager::new(
             20 * 1024 * 1024,
             std::time::Duration::from_secs(24 * 60 * 60),
@@ -615,6 +721,35 @@ async fn run_bot() -> anyhow::Result<()> {
         state: (*state).clone(),
     })
     .await?;
+
+    let queue_state = state.clone();
+    let queue_http = client.http.clone();
+    tokio::spawn(async move {
+        while let Some((channel_id_u64, input)) = queued_loop_rx.recv().await {
+            let channel_id = serenity::model::id::ChannelId::from(channel_id_u64);
+            let channel_id_str = channel_id.to_string();
+            let channel_config = ChannelConfig::load().await.unwrap_or_default();
+            let agent_type = channel_config.get_agent_type(&channel_id_str);
+            match queue_state
+                .session_manager
+                .get_or_create_session(channel_id_u64, agent_type, &queue_state.backend_manager)
+                .await
+            {
+                Ok((agent, is_new)) => {
+                    Handler::start_agent_loop(
+                        agent,
+                        queue_http.clone(),
+                        channel_id,
+                        (*queue_state).clone(),
+                        Some(input),
+                        is_new,
+                    )
+                    .await;
+                }
+                Err(e) => error!("❌ Failed to run queued input: {}", e),
+            }
+        }
+    });
 
     // 初始化 CronManager 的執行環境
     state
