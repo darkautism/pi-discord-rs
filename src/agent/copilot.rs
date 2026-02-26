@@ -479,13 +479,31 @@ impl CopilotRuntime {
             .insert(session_id.to_string(), tx);
     }
 
-    async fn prompt(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
-        // Serialise all session/prompt calls so we never send a new prompt while
-        // Copilot is still processing the previous one.  When /abort is called,
-        // cancel() force-resolves the active oneshot, which causes the rx below to
-        // return immediately with an error — releasing this lock right away.
+    /// Sends a session/prompt request and returns a broadcast receiver that
+    /// was subscribed **inside** the prompt_lock, after the lock was acquired
+    /// but before the request was sent.
+    ///
+    /// Subscribing inside the lock is critical: any session/update events from
+    /// a previously cancelled prompt that Copilot emits while we are waiting
+    /// for the lock have no active receiver → they are naturally dropped.
+    /// Events from *this* prompt arrive only after we subscribed → received ✓
+    async fn prompt(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> anyhow::Result<broadcast::Receiver<AgentEvent>> {
         let _prompt_guard = self.prompt_lock.lock().await;
         self.ensure_alive().await?;
+
+        // Create the event receiver here, inside the lock, so we never see
+        // leftover events from a previously cancelled prompt.
+        let event_rx = {
+            let senders = self.session_senders.read().await;
+            senders
+                .get(session_id)
+                .map(|tx| tx.subscribe())
+                .ok_or_else(|| anyhow::anyhow!("No event sender for session {}", session_id))?
+        };
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -523,7 +541,7 @@ impl CopilotRuntime {
 
         *self.active_prompt_id.lock().await = None;
         result?;
-        Ok(())
+        Ok(event_rx)
     }
 
     async fn cancel(&self, session_id: &str) -> anyhow::Result<()> {
@@ -695,10 +713,15 @@ impl AiAgent for CopilotAgent {
     async fn prompt(&self, message: &str) -> anyhow::Result<()> {
         let generation = self.prompt_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session_id = self.session_id();
-        let mut stream_rx = self.event_tx.subscribe();
 
+        // runtime.prompt() acquires prompt_lock, subscribes to events inside
+        // the lock, sends the request, waits for Copilot to finish, and returns
+        // the event receiver.  Because the receiver was created inside the lock,
+        // any session/update events from a previously cancelled prompt (which
+        // had no subscriber) were dropped — so wait_for_stream_output below
+        // only sees events from THIS prompt.
         match self.runtime.prompt(&session_id, message).await {
-            Ok(_) => {
+            Ok(mut stream_rx) => {
                 if self.prompt_generation.load(Ordering::SeqCst) != generation {
                     return Ok(());
                 }

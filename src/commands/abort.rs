@@ -1,7 +1,6 @@
 use super::SlashCommand;
 use async_trait::async_trait;
 use serenity::all::{CommandInteraction, Context, EditInteractionResponse};
-use tracing::warn;
 
 pub struct AbortCommand;
 
@@ -27,13 +26,13 @@ impl SlashCommand for AbortCommand {
             let mut active = state.active_renders.lock().await;
             active.remove(&command.channel_id.get())
         };
-        if let Some((msg_id, handles)) = active {
+        if let Some((_msg_id, handles)) = active {
             for handle in handles {
                 handle.abort();
             }
-            if let Err(e) = command.channel_id.delete_message(&ctx.http, msg_id).await {
-                warn!("Failed to delete aborted in-flight message: {}", e);
-            }
+            // Do not delete the message: the user may want to keep the partial
+            // output as a record.  The render task stopped updating it; whatever
+            // content was last rendered stays visible in Discord.
         }
         {
             let mut pending = state.pending_inputs.lock().await;
